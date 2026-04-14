@@ -116,6 +116,7 @@ void syncReadingInterval();
 bool ensureDeviceRegistered();
 void readAndSendSensorData();
 bool syncOffsetWithServer();
+bool syncDeviceLocationWithServer();
 bool reportOffsetToServer();
 void sendHeartbeat();
 String formatUptime(unsigned long ms);
@@ -164,16 +165,34 @@ String logUpdateAttempt(String fromVersion, String toVersion, String status, Str
 void updateLogStatus(String updateId, String status, String error, int duration, int bytes);
 bool performOTAUpdate(FirmwareInfo &info);
 void validateOTAUpdate();
-bool isMax31865DiagMode();
-void runMax31865Diagnostics();
 
 // Configurações Supabase (FIXAS - não precisam ser configuradas)
+#include "../include/secrets.h"
+
+#ifndef SUPABASE_ANON_KEY
+#define SUPABASE_ANON_KEY "YOUR_SUPABASE_ANON_KEY"
+#endif
+#ifndef GOOGLE_GEOLOCATION_API_KEY
+#define GOOGLE_GEOLOCATION_API_KEY "YOUR_GOOGLE_GEOLOCATION_API_KEY"
+#endif
+
 const char *supabaseUrl = "https://qanyszslnactgtzpmtyj.supabase.co";
-const char *supabaseKey = "YOUR_SUPABASE_ANON_KEY";
+const char *supabaseKey = SUPABASE_ANON_KEY;
+
+bool beginSupabaseRequest(HTTPClient &http, WiFiClientSecure &client, const String &url)
+{
+    client.setInsecure();
+    client.setTimeout(15000);
+    bool ok = http.begin(client, url);
+    if (!ok) return false;
+    http.addHeader("apikey", supabaseKey);
+    http.addHeader("Authorization", "Bearer " + String(supabaseKey));
+    return true;
+}
 
 // Configurações Google Geolocation API
 // Obtenha sua chave em: https://console.cloud.google.com/apis/credentials
-const char *googleGeoApiKey = "YOUR_GOOGLE_GEOLOCATION_API_KEY";
+const char *googleGeoApiKey = GOOGLE_GEOLOCATION_API_KEY;
 const char *googleGeoApiUrl = "https://www.googleapis.com/geolocation/v1/geolocate";
 const bool useGeolocation = true; // ✅ Executa apenas 1x no primeiro boot, depois desabilita automaticamente
 
@@ -347,75 +366,6 @@ float readPT100Temperature()
     return temperature;
 }
 
-bool isMax31865DiagMode()
-{
-    unsigned long windowStart = millis();
-    const unsigned long windowMs = 6000;
-    const unsigned long holdMs = 2000;
-
-    while (millis() - windowStart < windowMs) {
-        if (digitalRead(CONFIG_BUTTON_PIN) == LOW) {
-            unsigned long holdStart = millis();
-            while (digitalRead(CONFIG_BUTTON_PIN) == LOW && (millis() - holdStart < holdMs)) {
-                delay(25);
-            }
-            if (digitalRead(CONFIG_BUTTON_PIN) == LOW && (millis() - holdStart >= holdMs)) {
-                return true;
-            }
-        }
-        delay(25);
-    }
-
-    return false;
-}
-
-void runMax31865Diagnostics()
-{
-    Serial.println("\n🧪 MODO DIAGNÓSTICO MAX31865");
-    Serial.println("   Após reiniciar, aguarde o boot e segure BOOT por 2s (não segure durante o reset, para não entrar em modo download)");
-    Serial.println("   Para sair: segure BOOT por 3s para reiniciar\n");
-
-    bool ok = initMAX31865();
-    if (!ok) {
-        Serial.println("⚠️ Inicialização falhou. Continuando para testes de leitura.");
-    }
-
-    for (;;) {
-        uint8_t regs[8] = {0};
-        for (uint8_t i = 0; i < 8; i++) regs[i] = max31865Read8(i);
-
-        uint8_t rtdRaw[2] = {0, 0};
-        max31865ReadN(0x01, rtdRaw, 2);
-
-        uint16_t rtd = (uint16_t(rtdRaw[0]) << 8) | uint16_t(rtdRaw[1]);
-        rtd >>= 1;
-        float resistance = max31865RTDToResistance(rtd);
-        float temperature = max31865ResistanceToTemp(resistance);
-        uint8_t fault = regs[0x07];
-
-        Serial.printf("REGS: 00=%02X 01=%02X 02=%02X 03=%02X 04=%02X 05=%02X 06=%02X 07=%02X\n",
-                      regs[0], regs[1], regs[2], regs[3], regs[4], regs[5], regs[6], regs[7]);
-        Serial.printf("RTD_RAW=%02X %02X | RTD=%u | R=%.3fΩ | T=%.2f°C | fault=0x%02X\n",
-                      rtdRaw[0], rtdRaw[1], rtd, resistance, temperature, fault);
-
-        if (fault) {
-            max31865ClearFault();
-        }
-
-        unsigned long btnStart = millis();
-        while (digitalRead(CONFIG_BUTTON_PIN) == LOW) {
-            if (millis() - btnStart > 3000) {
-                Serial.println("🔄 Reiniciando...");
-                delay(100);
-                ESP.restart();
-            }
-            delay(25);
-        }
-
-        delay(1000);
-    }
-}
-
 // Variáveis configuráveis (salvas na EEPROM)
 String deviceId;
 String deviceName;
@@ -468,7 +418,10 @@ const int BATTERY_FINAL_SEND_COUNT = 4; // Número de envios antes de hibernar
 
 // ===== CONFIGURAÇÕES DE VERSÃO =====
 #define FIRMWARE_VERSION "Thermo Watch Nitro"  // Nome do AP WiFi e identificação
-#define CURRENT_FIRMWARE_VERSION "4.1"       // Versão numérica (current_firmware)
+#ifndef CURRENT_FIRMWARE_VERSION
+#define CURRENT_FIRMWARE_VERSION "4.2"
+#endif
+static const char *DEVICE_DB_NAME = "Thermo Watch - Nitro";
 
 // ===== CONFIGURAÇÕES OTA (Over-The-Air Updates) =====
 const int OTA_CHECK_INTERVAL_WAKES = 24;       // Checar update a cada 24 wakes (24h)
@@ -491,6 +444,7 @@ unsigned long lastConfigMessage = 0;
 const unsigned long heartbeatInterval = 60000; // 1 minuto
 const unsigned long configMessageInterval = 5000; // 5 segundos
 bool shouldSaveConfig = false;
+bool shouldRestartAfterConfig = false;
 int resetCounter = 0;
 unsigned long lastResetTime = 0;
 
@@ -517,6 +471,47 @@ void saveConfigCallback()
 
 // ===== FUNÇÕES OTA (Over-The-Air Updates) =====
 
+String sanitizeOtaUrl(String url)
+{
+    url.trim();
+    url.replace("`", "");
+    url.trim();
+    url.replace(" ", "");
+    url.trim();
+    if (url.startsWith("\"") && url.endsWith("\"") && url.length() >= 2) {
+        url = url.substring(1, url.length() - 1);
+    }
+    url.trim();
+    return url;
+}
+
+String normalizeVersion(String v)
+{
+    v.trim();
+    if (v.startsWith("v") || v.startsWith("V")) {
+        v = v.substring(1);
+    }
+    v.trim();
+    return v;
+}
+
+bool isSameVersion(String a, String b)
+{
+    return normalizeVersion(a) == normalizeVersion(b);
+}
+
+unsigned long getEpochNow()
+{
+    time_t now = time(nullptr);
+    if (now < 100000) return 0;
+    return (unsigned long)now;
+}
+
+unsigned long getMillisNow()
+{
+    return millis();
+}
+
 // Verificar se deve checar por atualizações OTA
 bool shouldCheckForUpdate() {
     // Checar a CADA comunicação (toda vez que acorda do deep sleep)
@@ -535,13 +530,15 @@ FirmwareInfo checkFirmwareUpdate() {
     }
     
     HTTPClient http;
-    // USAR RPC ESPECÍFICA DO NITRO
     String url = String(supabaseUrl) + "/rest/v1/rpc/check_firmware_update_nitro";
-    
-    http.begin(url);
+    WiFiClientSecure client;
+    if (!beginSupabaseRequest(http, client, url)) {
+        Serial.println("❌ OTA: Falha ao iniciar HTTPS (Supabase RPC)");
+        http.end();
+        return info;
+    }
     http.addHeader("Content-Type", "application/json");
-    http.addHeader("apikey", supabaseKey);
-    http.addHeader("Authorization", "Bearer " + String(supabaseKey));
+    http.setTimeout(15000);
     
     // Construir body JSON com p_device_id e versão atual
     DynamicJsonDocument docPayload(512);
@@ -576,6 +573,12 @@ FirmwareInfo checkFirmwareUpdate() {
                 // Verifica campos de URL com fallback
                 if (doc.containsKey("url")) info.url = doc["url"].as<String>();
                 else if (doc.containsKey("download_url")) info.url = doc["download_url"].as<String>();
+                else if (doc.containsKey("firmware_url")) info.url = doc["firmware_url"].as<String>();
+                
+                info.url = sanitizeOtaUrl(info.url);
+                if (!info.url.startsWith("http://") && !info.url.startsWith("https://") && info.url.length() > 0) {
+                    info.url = String(supabaseUrl) + "/storage/v1/object/public/firmware-releases/" + info.url;
+                }
                 
                 info.md5_hash = doc["md5_hash"].as<String>();
                 if (info.md5_hash.length() == 0 && doc.containsKey("md5")) info.md5_hash = doc["md5"].as<String>();
@@ -588,7 +591,30 @@ FirmwareInfo checkFirmwareUpdate() {
                 info.min_rssi = doc["min_rssi"] | OTA_MIN_RSSI;
                 
                 // Comparar versões (redundância, já que a RPC deve filtrar)
-                if (info.version != CURRENT_FIRMWARE_VERSION) {
+                if (!isSameVersion(info.version, CURRENT_FIRMWARE_VERSION)) {
+                    String lastTarget = preferences.getString("ota_tgt", "");
+                    unsigned long lastAttempt = preferences.getULong("ota_ts", 0);
+                    int failures = preferences.getInt("ota_failures", 0);
+                    unsigned long nowEpoch = getEpochNow();
+                    unsigned long lastAttemptMs = preferences.getULong("ota_ms", 0);
+                    unsigned long nowMs = getMillisNow();
+                    unsigned long minDelayMs = 0;
+                    if (failures == 1) minDelayMs = 5UL * 60UL * 1000UL;
+                    else if (failures == 2) minDelayMs = 15UL * 60UL * 1000UL;
+                    else if (failures >= 3) minDelayMs = 60UL * 60UL * 1000UL;
+
+                    if (failures > 0 && nowEpoch > 0 && lastTarget == info.version && lastAttempt > 0 && (nowEpoch - lastAttempt) < 900) {
+                        Serial.println("⚠️  OTA: Tentativa recente para a mesma versão. Aguardando antes de tentar novamente.");
+                        http.end();
+                        return info;
+                    }
+                    
+                    if (failures > 0 && minDelayMs > 0 && lastTarget == info.version && lastAttemptMs > 0 && (unsigned long)(nowMs - lastAttemptMs) < minDelayMs) {
+                        Serial.println("⚠️  OTA: Falhas recentes para a mesma versão. Aguardando antes de tentar novamente.");
+                        http.end();
+                        return info;
+                    }
+
                     info.available = true;
                     Serial.printf("✨ OTA: Nova versão disponível: %s → %s\n", CURRENT_FIRMWARE_VERSION, info.version.c_str());
                     
@@ -615,6 +641,11 @@ FirmwareInfo checkFirmwareUpdate() {
 
 // Validar se pode executar update
 bool canPerformUpdate(FirmwareInfo &info, float batteryPercentage, int rssi) {
+    if (isSameVersion(info.version, CURRENT_FIRMWARE_VERSION)) {
+        Serial.println("✅ OTA: Versão do servidor é igual a atual. Ignorando.");
+        return false;
+    }
+
     // Se obrigatória, ignora condições (exceto bateria crítica)
     if (info.mandatory) {
         if (batteryPercentage < 20) {
@@ -650,12 +681,14 @@ String logUpdateAttempt(String fromVersion, String toVersion, String status, Str
     float batteryPercentage = preferences.getFloat("last_battery_pct", 0);
     int rssi = WiFi.RSSI();
     
-    // USAR TABELA ESPECÍFICA DO NITRO
     String url = String(supabaseUrl) + "/rest/v1/device_updates_nitro";
-    http.begin(url);
+    WiFiClientSecure client;
+    if (!beginSupabaseRequest(http, client, url)) {
+        Serial.println("❌ OTA: Erro ao iniciar HTTPS (device_updates_nitro)");
+        http.end();
+        return "";
+    }
     http.addHeader("Content-Type", "application/json");
-    http.addHeader("apikey", supabaseKey);
-    http.addHeader("Authorization", "Bearer " + String(supabaseKey));
     http.addHeader("Prefer", "return=representation");
     
     DynamicJsonDocument doc(512);
@@ -679,8 +712,10 @@ String logUpdateAttempt(String fromVersion, String toVersion, String status, Str
     if (httpCode == 201) {
         String response = http.getString();
         DynamicJsonDocument respDoc(512);
-        deserializeJson(respDoc, response);
-        updateId = respDoc[0]["id"].as<String>();
+        DeserializationError jsonErr = deserializeJson(respDoc, response);
+        if (!jsonErr && respDoc.is<JsonArray>() && respDoc.size() > 0) {
+            updateId = respDoc[0]["id"].as<String>();
+        }
         Serial.printf("📝 OTA: Registrado no banco NITRO (ID: %s)\n", updateId.c_str());
     } else {
         Serial.printf("❌ OTA: Erro ao registrar log: %d\n", httpCode);
@@ -696,13 +731,13 @@ void updateLogStatus(String updateId, String status, String error = "", int dura
     if (updateId.length() == 0) return;
     
     HTTPClient http;
-    // USAR TABELA ESPECÍFICA DO NITRO
     String url = String(supabaseUrl) + "/rest/v1/device_updates_nitro?id=eq." + updateId;
-    
-    http.begin(url);
+    WiFiClientSecure client;
+    if (!beginSupabaseRequest(http, client, url)) {
+        http.end();
+        return;
+    }
     http.addHeader("Content-Type", "application/json");
-    http.addHeader("apikey", supabaseKey);
-    http.addHeader("Authorization", "Bearer " + String(supabaseKey));
     
     DynamicJsonDocument doc(512);
     doc["status"] = status;
@@ -727,6 +762,13 @@ bool performOTAUpdate(FirmwareInfo &info) {
     
     unsigned long startTime = millis();
     String updateId = logUpdateAttempt(CURRENT_FIRMWARE_VERSION, info.version, "downloading");
+
+    preferences.putString("ota_tgt", info.version);
+    unsigned long nowEpoch = getEpochNow();
+    if (nowEpoch > 0) {
+        preferences.putULong("ota_ts", nowEpoch);
+    }
+    preferences.putULong("ota_ms", getMillisNow());
     
     // Configurar LED
     digitalWrite(LED_PIN, HIGH);
@@ -738,6 +780,7 @@ bool performOTAUpdate(FirmwareInfo &info) {
     // Configurar WiFiClientSecure para HTTPS (Supabase/Cloudflare)
     WiFiClientSecure client;
     client.setInsecure(); // Desabilitar verificação SSL para simplificar
+    client.setTimeout(30000);
     
     // Configurar HTTPClient com headers obrigatórios (previne 400 Bad Request do Cloudflare)
     HTTPClient http;
@@ -767,13 +810,44 @@ bool performOTAUpdate(FirmwareInfo &info) {
     int contentLength = http.getSize();
     Serial.printf("📦 Tamanho do firmware: %d bytes\n", contentLength);
     
-    if (contentLength <= 0 || contentLength != info.file_size) {
+    if (contentLength <= 0) {
         String error = "Invalid content length: " + String(contentLength);
         Serial.printf("❌ OTA FALHOU: %s\n", error.c_str());
         updateLogStatus(updateId, "failed", error, (millis() - startTime) / 1000);
         http.end();
         digitalWrite(LED_PIN, LOW);
+        
+        int failures = preferences.getInt("ota_failures", 0) + 1;
+        preferences.putInt("ota_failures", failures);
         return false;
+    }
+    
+    if (contentLength < 200000) {
+        String error = "Firmware too small: " + String(contentLength);
+        Serial.printf("❌ OTA FALHOU: %s\n", error.c_str());
+        updateLogStatus(updateId, "failed", error, (millis() - startTime) / 1000, contentLength);
+        http.end();
+        digitalWrite(LED_PIN, LOW);
+        
+        int failures = preferences.getInt("ota_failures", 0) + 1;
+        preferences.putInt("ota_failures", failures);
+        return false;
+    }
+    
+    if (info.file_size > 0 && contentLength != info.file_size) {
+        String error = "Content-Length (" + String(contentLength) + ") != file_size (" + String(info.file_size) + ")";
+        Serial.printf("❌ OTA FALHOU: %s\n", error.c_str());
+        updateLogStatus(updateId, "failed", error, (millis() - startTime) / 1000, contentLength);
+        http.end();
+        digitalWrite(LED_PIN, LOW);
+        
+        int failures = preferences.getInt("ota_failures", 0) + 1;
+        preferences.putInt("ota_failures", failures);
+        return false;
+    }
+    
+    if (info.md5_hash.length() == 32) {
+        Update.setMD5(info.md5_hash.c_str());
     }
     
     // Iniciar update
@@ -783,13 +857,41 @@ bool performOTAUpdate(FirmwareInfo &info) {
         updateLogStatus(updateId, "failed", error, (millis() - startTime) / 1000);
         http.end();
         digitalWrite(LED_PIN, LOW);
+        
+        int failures = preferences.getInt("ota_failures", 0) + 1;
+        preferences.putInt("ota_failures", failures);
         return false;
     }
     
     // Baixar e instalar
     Serial.println("⏬ Baixando e instalando firmware...");
     WiFiClient* stream = http.getStreamPtr();
-    size_t written = Update.writeStream(*stream);
+    size_t written = 0;
+    uint8_t buff[1024];
+    unsigned long lastDataMs = millis();
+
+    while (http.connected() && written < (size_t)contentLength) {
+        size_t available = stream->available();
+        if (available) {
+            size_t toRead = available;
+            if (toRead > sizeof(buff)) toRead = sizeof(buff);
+            int readBytes = stream->readBytes(buff, toRead);
+            if (readBytes > 0) {
+                size_t w = Update.write(buff, (size_t)readBytes);
+                if (w != (size_t)readBytes) {
+                    break;
+                }
+                written += w;
+                lastDataMs = millis();
+            }
+        } else {
+            if (millis() - lastDataMs > 30000) {
+                break;
+            }
+            delay(1);
+            yield();
+        }
+    }
     
     unsigned long duration = (millis() - startTime) / 1000;
     
@@ -800,6 +902,9 @@ bool performOTAUpdate(FirmwareInfo &info) {
         Update.abort();
         http.end();
         digitalWrite(LED_PIN, LOW);
+        
+        int failures = preferences.getInt("ota_failures", 0) + 1;
+        preferences.putInt("ota_failures", failures);
         return false;
     }
     
@@ -809,6 +914,9 @@ bool performOTAUpdate(FirmwareInfo &info) {
         updateLogStatus(updateId, "failed", error, duration);
         http.end();
         digitalWrite(LED_PIN, LOW);
+        
+        int failures = preferences.getInt("ota_failures", 0) + 1;
+        preferences.putInt("ota_failures", failures);
         return false;
     }
     
@@ -818,11 +926,14 @@ bool performOTAUpdate(FirmwareInfo &info) {
         updateLogStatus(updateId, "failed", error, duration);
         http.end();
         digitalWrite(LED_PIN, LOW);
+        
+        int failures = preferences.getInt("ota_failures", 0) + 1;
+        preferences.putInt("ota_failures", failures);
         return false;
     }
     
     Serial.println("✅ OTA: Firmware baixado e instalado com sucesso!");
-    updateLogStatus(updateId, "success", "", duration, info.file_size);
+    updateLogStatus(updateId, "success", "", duration, contentLength);
     
     preferences.putInt("ota_failures", 0);
     preferences.putString("pending_version", info.version);
@@ -843,24 +954,33 @@ void validateOTAUpdate() {
     if (pendingVersion.length() > 0 && pendingVersion == CURRENT_FIRMWARE_VERSION) {
         Serial.printf("✅ OTA: Update validado! Versão %s operacional\n", CURRENT_FIRMWARE_VERSION);
         
+        if (WiFi.status() != WL_CONNECTED) {
+            Serial.println("⚠️ OTA: WiFi desconectado - validação no servidor será feita quando conectar");
+            return;
+        }
+
         HTTPClient http;
         String deviceId = preferences.getString("device_id", "");
         String url = String(supabaseUrl) + "/rest/v1/devices?id=eq." + deviceId;
-        
-        http.begin(url);
+        WiFiClientSecure client;
+        if (!beginSupabaseRequest(http, client, url)) {
+            http.end();
+            return;
+        }
         http.addHeader("Content-Type", "application/json");
-        http.addHeader("apikey", supabaseKey);
-        http.addHeader("Authorization", "Bearer " + String(supabaseKey));
+        http.addHeader("Prefer", "return=minimal");
         
         DynamicJsonDocument doc(256);
         doc["current_firmware"] = CURRENT_FIRMWARE_VERSION;
         
         String jsonData;
         serializeJson(doc, jsonData);
-        http.PATCH(jsonData);
+        int httpCode = http.PATCH(jsonData);
         http.end();
         
-        preferences.remove("pending_version");
+        if (httpCode == 200 || httpCode == 204) {
+            preferences.remove("pending_version");
+        }
     }
 }
 
@@ -967,10 +1087,6 @@ void setup()
     pinMode(BATTERY_PIN, INPUT); // Configurar pino da bateria como entrada analógica
     digitalWrite(LED_PIN, LOW);
 
-    if (isMax31865DiagMode()) {
-        runMax31865Diagnostics();
-    }
-    
     // Configurar sistema de alarme de temperatura
     pinMode(TEMP_ALERT_LED1, OUTPUT);
     pinMode(TEMP_ALERT_LED2, OUTPUT);
@@ -1120,9 +1236,14 @@ void loadSavedConfig()
 {
     Serial.println("📖 Carregando configurações salvas...");
 
-    deviceName = preferences.getString("device_name", "Thermo Watch - Nitro");
+    deviceName = preferences.getString("device_name", DEVICE_DB_NAME);
+    if (deviceName != DEVICE_DB_NAME) {
+        deviceName = DEVICE_DB_NAME;
+        preferences.putString("device_name", deviceName);
+    }
     deviceLocation = preferences.getString("device_location", "Localização não definida");
     readingIntervalSec = preferences.getInt("read_interval", 3600);
+    tempOffset = preferences.getFloat("temp_offset", TEMP_OFFSET);
 
     // Gerar ID único baseado no MAC address se não existir
     deviceId = preferences.getString("device_id", "");
@@ -1286,10 +1407,19 @@ void connectWiFi()
     Serial.println("🌐 IP: " + WiFi.localIP().toString());
     Serial.println("📡 RSSI: " + String(WiFi.RSSI()) + " dBm");
 
+    validateOTAUpdate();
+
     // Sincronizar horário via NTP
     syncNTP();
 
     blinkLED(2, 500); // 2 piscadas lentas = WiFi conectado
+
+    if (shouldRestartAfterConfig) {
+        Serial.println("🔄 Reiniciando para aplicar configuração...");
+        Serial.flush();
+        delay(1000);
+        ESP.restart();
+    }
 }
 
 void saveCustomConfig()
@@ -1297,7 +1427,7 @@ void saveCustomConfig()
     Serial.println("💾 Salvando configurações personalizadas...");
 
     // DEVICE_NAME é FIXO ("Thermo Watch - Nitro") - não pode ser alterado
-    String newDeviceName = "Thermo Watch - Nitro";  // FIXO para OTA
+    String newDeviceName = DEVICE_DB_NAME;
     String newDeviceLocation = custom_device_location.getValue();
     int newReadingInterval = String(custom_reading_interval.getValue()).toInt();
 
@@ -1338,6 +1468,7 @@ void saveCustomConfig()
     Serial.println("✅ Próximo boot irá obter e enviar geolocalização novamente");
 
     shouldSaveConfig = false;
+    shouldRestartAfterConfig = true;
     
     Serial.println("✅ Configurações salvas com sucesso!");
     Serial.println("💡 LED: APAGADO");
@@ -1385,7 +1516,12 @@ bool testSupabaseConnection()
         Serial.printf("   🔄 [%d/%d] Tentando conectar Supabase...\n", attempt, MAX_RETRY_ATTEMPTS);
         
         HTTPClient http;
-        http.begin(testUrl);
+        WiFiClientSecure client;
+        if (!beginSupabaseRequest(http, client, testUrl)) {
+            Serial.println("   ❌ Falha ao iniciar HTTPS");
+            http.end();
+            continue;
+        }
         http.setTimeout(8000);
         
         int httpCode = http.GET();
@@ -1402,6 +1538,10 @@ bool testSupabaseConnection()
         
         Serial.printf("   ❌ Tentativa %d falhou | HTTP Code: %d\n", attempt, httpCode);
         Serial.printf("   ⚠️ Erro: %s\n", http.errorToString(httpCode).c_str());
+        if (http.connected()) {
+            response = http.getString();
+            Serial.printf("   📄 Resposta (primeiros 100 chars): %s\n", response.substring(0, 100).c_str());
+        }
         http.end();
         
         if (attempt < MAX_RETRY_ATTEMPTS) {
@@ -1583,9 +1723,11 @@ bool reportOffsetToServer()
 {
     Serial.println("📤 Reportando offset ao servidor...");
     HTTPClient http;
-    http.begin(String(supabaseUrl) + "/rest/v1/devices?id=eq." + deviceId);
-    http.addHeader("apikey", supabaseKey);
-    http.addHeader("Authorization", "Bearer " + String(supabaseKey));
+    WiFiClientSecure client;
+    if (!beginSupabaseRequest(http, client, String(supabaseUrl) + "/rest/v1/devices?id=eq." + deviceId)) {
+        http.end();
+        return false;
+    }
     http.addHeader("Content-Type", "application/json");
     http.addHeader("Prefer", "return=minimal");
     
@@ -1607,9 +1749,11 @@ bool syncOffsetWithServer()
 {
     Serial.println("🔄 Sincronizando offset com servidor...");
     HTTPClient http;
-    http.begin(String(supabaseUrl) + "/rest/v1/devices?select=temp_offset&id=eq." + deviceId);
-    http.addHeader("apikey", supabaseKey);
-    http.addHeader("Authorization", "Bearer " + String(supabaseKey));
+    WiFiClientSecure client;
+    if (!beginSupabaseRequest(http, client, String(supabaseUrl) + "/rest/v1/devices?select=temp_offset&id=eq." + deviceId)) {
+        http.end();
+        return false;
+    }
     
     int httpCode = http.GET();
     
@@ -1619,29 +1763,127 @@ bool syncOffsetWithServer()
         DeserializationError error = deserializeJson(doc, response);
         
         if (!error && doc.size() > 0) {
-            float serverOffset = doc[0]["temp_offset"] | 0.0;
-            
-            // Se servidor tem offset válido (> 0.1), usar ele
-            if (serverOffset > 0.1) {
-                if (abs(serverOffset - tempOffset) > 0.1) {
-                    Serial.printf("🔄 Atualizando offset: %.1f°C → %.1f°C (servidor)\n", tempOffset, serverOffset);
-                    tempOffset = serverOffset;
-                } else {
-                    Serial.printf("✅ Offset sincronizado: %.1f°C\n", tempOffset);
-                }
-                http.end();
-                return true;
-            } else {
-                // Servidor retornou 0.0 = sem offset configurado
-                Serial.println("⚠️ Servidor retornou offset 0.0 (não configurado)");
+            JsonVariant offsetField = doc[0]["temp_offset"];
+            if (offsetField.isNull()) {
+                Serial.println("⚠️ Servidor não possui temp_offset (null)");
                 http.end();
                 return false;
             }
+
+            float serverOffset = offsetField.as<float>();
+            if (!isfinite(serverOffset)) {
+                Serial.println("⚠️ Servidor retornou temp_offset inválido (NaN/Inf)");
+                http.end();
+                return false;
+            }
+
+            if (abs(serverOffset) > 10.0f) {
+                Serial.printf("⚠️ temp_offset no BD fora da faixa (%.2f). Forçando 0.0 e reportando ao servidor.\n", serverOffset);
+                tempOffset = 0.0f;
+                preferences.putFloat("temp_offset", tempOffset);
+                http.end();
+                reportOffsetToServer();
+                return true;
+            }
+            if (abs(serverOffset - tempOffset) > 0.01f) {
+                Serial.printf("🔄 Atualizando offset: %.2f°C → %.2f°C (servidor)\n", tempOffset, serverOffset);
+                tempOffset = serverOffset;
+                preferences.putFloat("temp_offset", tempOffset);
+            } else {
+                Serial.printf("✅ Offset sincronizado: %.2f°C\n", tempOffset);
+            }
+            http.end();
+            return true;
         }
     }
     
     Serial.printf("⚠️ Falha na sincronização - mantendo offset local: %.1f°C\n", tempOffset);
     http.end();
+    return false;
+}
+
+bool syncDeviceLocationWithServer()
+{
+    Serial.println("🔄 Sincronizando localização do device com servidor...");
+
+    HTTPClient http;
+    WiFiClientSecure client;
+    if (!beginSupabaseRequest(http, client, String(supabaseUrl) + "/rest/v1/devices?select=location&id=eq." + deviceId)) {
+        http.end();
+        return false;
+    }
+
+    int httpCode = http.GET();
+    if (httpCode == 200) {
+        String response = http.getString();
+        StaticJsonDocument<512> doc;
+        DeserializationError error = deserializeJson(doc, response);
+        if (!error && doc.size() > 0) {
+            JsonVariant locationField = doc[0]["location"];
+            if (!locationField.isNull()) {
+                String serverLocation = locationField.as<String>();
+                serverLocation.trim();
+                String localLocation = deviceLocation;
+                localLocation.trim();
+
+                bool serverIsDefault =
+                    serverLocation.length() == 0 ||
+                    serverLocation == "Localização não informada" ||
+                    serverLocation == "Localização não definida";
+
+                bool localIsDefault =
+                    localLocation.length() == 0 ||
+                    localLocation == "Localização não informada" ||
+                    localLocation == "Localização não definida";
+
+                if (!serverIsDefault && serverLocation != localLocation) {
+                    Serial.println("🔄 Atualizando localização: '" + deviceLocation + "' → '" + serverLocation + "' (servidor)");
+                    deviceLocation = serverLocation;
+                    preferences.putString("device_location", deviceLocation);
+                    deviceDescription = "Sensor de temperatura Thermo Watch - Nitro em " + deviceLocation;
+                    http.end();
+                    return true;
+                }
+
+                if (serverIsDefault && !localIsDefault) {
+                    http.end();
+
+                    Serial.println("📤 Servidor sem localização válida - enviando localização local...");
+                    HTTPClient httpPatch;
+                    WiFiClientSecure clientPatch;
+                    if (!beginSupabaseRequest(httpPatch, clientPatch, String(supabaseUrl) + "/rest/v1/devices?id=eq." + deviceId)) {
+                        httpPatch.end();
+                        return false;
+                    }
+                    httpPatch.addHeader("Content-Type", "application/json");
+                    httpPatch.addHeader("Prefer", "return=minimal");
+
+                    DynamicJsonDocument patchDoc(256);
+                    patchDoc["location"] = deviceLocation;
+                    patchDoc["description"] = deviceDescription;
+                    String patchJson;
+                    serializeJson(patchDoc, patchJson);
+
+                    int patchCode = httpPatch.PATCH(patchJson);
+                    httpPatch.end();
+
+                    if (patchCode == 200 || patchCode == 204) {
+                        Serial.println("✅ Localização enviada ao servidor");
+                        return true;
+                    }
+                    Serial.printf("⚠️ Falha ao enviar localização (HTTP %d)\n", patchCode);
+                    return false;
+                }
+
+                Serial.println("✅ Localização já está sincronizada");
+                http.end();
+                return true;
+            }
+        }
+    }
+
+    http.end();
+    Serial.println("⚠️ Não foi possível sincronizar localização (mantendo local)");
     return false;
 }
 
@@ -1651,22 +1893,26 @@ void registerDevice()
 
     // Usa PATCH para sempre atualizar se existir, sem verificar antes
     HTTPClient http;
-    http.begin(String(supabaseUrl) + "/rest/v1/devices?id=eq." + deviceId);
+    WiFiClientSecure client;
+    if (!beginSupabaseRequest(http, client, String(supabaseUrl) + "/rest/v1/devices?id=eq." + deviceId)) {
+        Serial.println("❌ Falha ao iniciar conexão HTTPS com Supabase");
+        http.end();
+        return;
+    }
     http.addHeader("Content-Type", "application/json");
-    http.addHeader("apikey", supabaseKey);
-    http.addHeader("Authorization", "Bearer " + String(supabaseKey));
     http.addHeader("Prefer", "resolution=merge-duplicates,return=representation");
     http.setTimeout(10000);
 
     // Criar JSON do dispositivo com mais informações
     DynamicJsonDocument doc(1024);
     doc["id"] = deviceId;
-    doc["name"] = deviceName;
+    doc["name"] = DEVICE_DB_NAME;
     doc["description"] = deviceDescription;
     doc["location"] = deviceLocation;
     doc["mac_address"] = WiFi.macAddress();
     doc["firmware_version"] = String("ThermoWatch_v") + CURRENT_FIRMWARE_VERSION + "_WiFiManager";
     doc["current_firmware"] = CURRENT_FIRMWARE_VERSION;
+    doc["temp_offset"] = tempOffset;
     doc["is_online"] = true;
     doc["last_seen"] = getISOTimestamp();
     doc["signal_strength"] = WiFi.RSSI();
@@ -1697,18 +1943,28 @@ void registerDevice()
     {
         // Dispositivo não existe, fazer POST (insert)
         http.end();
-        http.begin(String(supabaseUrl) + "/rest/v1/devices");
-        http.addHeader("Content-Type", "application/json");
-        http.addHeader("apikey", supabaseKey);
-        http.addHeader("Authorization", "Bearer " + String(supabaseKey));
-        http.addHeader("Prefer", "return=representation");
-        http.setTimeout(10000);
+        HTTPClient httpPost;
+        WiFiClientSecure clientPost;
+        if (!beginSupabaseRequest(httpPost, clientPost, String(supabaseUrl) + "/rest/v1/devices")) {
+            Serial.println("❌ Falha ao iniciar conexão HTTPS com Supabase (POST devices)");
+            httpPost.end();
+            return;
+        }
+        httpPost.addHeader("Content-Type", "application/json");
+        httpPost.addHeader("Prefer", "return=representation");
+        httpPost.setTimeout(10000);
 
-        httpResponseCode = http.POST(jsonString);
+        DynamicJsonDocument insertDoc(1024);
+        deserializeJson(insertDoc, jsonString);
+        insertDoc["name"] = DEVICE_DB_NAME;
+        String insertJson;
+        serializeJson(insertDoc, insertJson);
+
+        httpResponseCode = httpPost.POST(insertJson);
         
         if (httpResponseCode > 0)
         {
-            String response = http.getString();
+            String response = httpPost.getString();
             Serial.println("✅ Dispositivo registrado com sucesso!");
         }
         else
@@ -1716,6 +1972,7 @@ void registerDevice()
             Serial.println("❌ Erro ao registrar dispositivo!");
             Serial.println("🔢 Código HTTP: " + String(httpResponseCode));
         }
+        httpPost.end();
     }
     else
     {
@@ -1739,13 +1996,16 @@ void updateDeviceBatteryStatus(float batteryVoltage, float batteryPercentage, St
     Serial.println("🔋 Atualizando status de bateria no dispositivo...");
 
     HTTPClient http;
-    http.begin(String(supabaseUrl) + "/rest/v1/devices?id=eq." + deviceId);
+    WiFiClientSecure client;
+    if (!beginSupabaseRequest(http, client, String(supabaseUrl) + "/rest/v1/devices?id=eq." + deviceId)) {
+        http.end();
+        return;
+    }
     http.addHeader("Content-Type", "application/json");
-    http.addHeader("apikey", supabaseKey);
-    http.addHeader("Authorization", "Bearer " + String(supabaseKey));
     http.setTimeout(10000);
 
     DynamicJsonDocument doc(512);
+    doc["name"] = DEVICE_DB_NAME;
     doc["is_online"] = true;
     doc["last_seen"] = getISOTimestamp();
     doc["battery_voltage"] = batteryVoltage;
@@ -1756,6 +2016,18 @@ void updateDeviceBatteryStatus(float batteryVoltage, float batteryPercentage, St
     doc["last_battery_check"] = getISOTimestamp();
     doc["power_mode"] = "BATTERY";
     doc["signal_strength"] = WiFi.RSSI();
+
+    String loc = deviceLocation;
+    loc.trim();
+    if (loc.length() > 0 && loc != "Localização não informada" && loc != "Localização não definida") {
+        doc["location"] = loc;
+        doc["description"] = deviceDescription;
+    }
+
+    doc["mac_address"] = WiFi.macAddress();
+    doc["firmware_version"] = String("ThermoWatch_v") + CURRENT_FIRMWARE_VERSION + "_WiFiManager";
+    doc["current_firmware"] = CURRENT_FIRMWARE_VERSION;
+    doc["temp_offset"] = tempOffset;
 
     // Metadados
     JsonObject metadata = doc.createNestedObject("metadata");
@@ -1792,9 +2064,11 @@ bool checkDeviceEnabled()
     Serial.println("🔐 Verificando habilitação do dispositivo...");
 
     HTTPClient http;
-    http.begin(String(supabaseUrl) + "/rest/v1/devices?id=eq." + deviceId + "&select=is_enabled");
-    http.addHeader("apikey", supabaseKey);
-    http.addHeader("Authorization", "Bearer " + String(supabaseKey));
+    WiFiClientSecure client;
+    if (!beginSupabaseRequest(http, client, String(supabaseUrl) + "/rest/v1/devices?id=eq." + deviceId + "&select=is_enabled")) {
+        http.end();
+        return true;
+    }
     http.setTimeout(10000);
 
     int httpCode = http.GET();
@@ -1874,9 +2148,11 @@ void syncReadingInterval()
     Serial.println("🔄 Sincronizando intervalo de leitura...");
     
     HTTPClient http;
-    http.begin(String(supabaseUrl) + "/rest/v1/devices?id=eq." + deviceId + "&select=reading_interval");
-    http.addHeader("apikey", supabaseKey);
-    http.addHeader("Authorization", "Bearer " + String(supabaseKey));
+    WiFiClientSecure client;
+    if (!beginSupabaseRequest(http, client, String(supabaseUrl) + "/rest/v1/devices?id=eq." + deviceId + "&select=reading_interval")) {
+        http.end();
+        return;
+    }
     http.setTimeout(10000);
     
     int httpCode = http.GET();
@@ -1928,10 +2204,12 @@ void syncReadingInterval()
                 Serial.println("📤 Intervalo não configurado no servidor - enviando valor local...");
                 
                 HTTPClient httpPatch;
-                httpPatch.begin(String(supabaseUrl) + "/rest/v1/devices?id=eq." + deviceId);
+                WiFiClientSecure clientPatch;
+                if (!beginSupabaseRequest(httpPatch, clientPatch, String(supabaseUrl) + "/rest/v1/devices?id=eq." + deviceId)) {
+                    httpPatch.end();
+                    return;
+                }
                 httpPatch.addHeader("Content-Type", "application/json");
-                httpPatch.addHeader("apikey", supabaseKey);
-                httpPatch.addHeader("Authorization", "Bearer " + String(supabaseKey));
                 httpPatch.setTimeout(10000);
                 
                 DynamicJsonDocument patchDoc(256);
@@ -1972,9 +2250,71 @@ void syncReadingInterval()
  */
 bool ensureDeviceRegistered()
 {
-    Serial.println("🔍 Sincronizando registro do dispositivo...");
-    registerDevice();
-    return true;
+    Serial.println("🔍 Verificando se o dispositivo está cadastrado...");
+
+    HTTPClient http;
+    WiFiClientSecure client;
+    if (!beginSupabaseRequest(http, client, String(supabaseUrl) + "/rest/v1/devices?select=id,name,mac_address,firmware_version,location&id=eq." + deviceId + "&limit=1")) {
+        http.end();
+        return false;
+    }
+
+    int httpCode = http.GET();
+    if (httpCode == 200) {
+        String response = http.getString();
+        http.end();
+
+        StaticJsonDocument<256> doc;
+        DeserializationError error = deserializeJson(doc, response);
+        if (!error && doc.is<JsonArray>() && doc.size() > 0) {
+            String serverName = doc[0]["name"] | "";
+            String serverMac = doc[0]["mac_address"] | "";
+            String serverFw = doc[0]["firmware_version"] | "";
+            String serverLoc = doc[0]["location"] | "";
+            serverName.trim();
+            serverMac.trim();
+            serverFw.trim();
+            serverLoc.trim();
+
+            String localLoc = deviceLocation;
+            localLoc.trim();
+
+            bool serverLocDefault =
+                serverLoc.length() == 0 ||
+                serverLoc == "Localização não informada" ||
+                serverLoc == "Localização não definida";
+
+            bool localLocDefault =
+                localLoc.length() == 0 ||
+                localLoc == "Localização não informada" ||
+                localLoc == "Localização não definida";
+
+            bool needsUpdate =
+                serverName != DEVICE_DB_NAME ||
+                serverMac.length() == 0 ||
+                serverFw.length() == 0 ||
+                (serverLocDefault && !localLocDefault);
+
+            if (needsUpdate) {
+                Serial.println("📝 Device cadastrado, mas incompleto - atualizando...");
+                registerDevice();
+            } else {
+                Serial.println("✅ Device já cadastrado");
+            }
+            return true;
+        }
+
+        Serial.println("📝 Device não encontrado - registrando...");
+        registerDevice();
+        return true;
+    }
+
+    Serial.printf("⚠️ Erro ao verificar cadastro (HTTP %d)\n", httpCode);
+    if (http.connected()) {
+        Serial.println("📄 Resposta: " + http.getString());
+    }
+    http.end();
+    return false;
 }
 
 void readAndSendSensorData()
@@ -2066,6 +2406,9 @@ void readAndSendSensorData()
     // 3. Sincronizar offset de temperatura
     syncOffsetWithServer();
 
+    // 3.1 Sincronizar localização do device
+    syncDeviceLocationWithServer();
+
     // 4. Verificar atualização de firmware (OTA)
     if (shouldCheckForUpdate()) {
          FirmwareInfo fwInfo = checkFirmwareUpdate();
@@ -2077,6 +2420,17 @@ void readAndSendSensorData()
          }
     }
     // ============================================================
+
+    ensureDeviceRegistered();
+    float batteryVoltageNow = readBatteryVoltage();
+    float batteryPercentageNow = getBatteryPercentage(batteryVoltageNow);
+    String batteryStatusNow = getBatteryStatus(batteryVoltageNow, batteryPercentageNow);
+
+    if (sendSensorData(temperature, humidity)) {
+        updateDeviceBatteryStatus(batteryVoltageNow, batteryPercentageNow, batteryStatusNow);
+    }
+
+    return;
     
     // ===== DEBUG: TESTE DE CONECTIVIDADE INTERNET =====
     Serial.println("🌐 Testando conectividade com internet...");
@@ -2835,10 +3189,12 @@ void displayBatteryInfo()
 bool sendSensorData(float temperature, float humidity)
 {
     HTTPClient http;
-    http.begin(String(supabaseUrl) + "/rest/v1/sensor_readings");
+    WiFiClientSecure client;
+    if (!beginSupabaseRequest(http, client, String(supabaseUrl) + "/rest/v1/sensor_readings")) {
+        http.end();
+        return false;
+    }
     http.addHeader("Content-Type", "application/json");
-    http.addHeader("apikey", supabaseKey);
-    http.addHeader("Authorization", "Bearer " + String(supabaseKey));
     http.setTimeout(15000); // 15 segundos - evita timeout com WiFi fraco (RSSI < -90dBm)
 
     // Criar JSON da leitura com dados da bateria
@@ -2925,10 +3281,12 @@ bool sendFinalBatteryNotification(float temperature, float humidity, float batte
     
     // 1. Enviar leitura final do sensor com flag especial
     HTTPClient http;
-    http.begin(String(supabaseUrl) + "/rest/v1/sensor_readings");
+    WiFiClientSecure client;
+    if (!beginSupabaseRequest(http, client, String(supabaseUrl) + "/rest/v1/sensor_readings")) {
+        http.end();
+        return false;
+    }
     http.addHeader("Content-Type", "application/json");
-    http.addHeader("apikey", supabaseKey);
-    http.addHeader("Authorization", "Bearer " + String(supabaseKey));
     http.setTimeout(15000); // Timeout maior para garantir envio
 
     DynamicJsonDocument doc(1024);
@@ -3467,8 +3825,23 @@ float performQuickReading()
         // 2. Enviar dados iniciais do alerta
         if (WiFi.status() == WL_CONNECTED) {
             Serial.println("📤 Enviando alerta inicial ao servidor...");
-            sendSensorData(temperature, humidity);
+            ensureDeviceRegistered();
+            syncOffsetWithServer();
+            syncDeviceLocationWithServer();
+            bool sent = sendSensorData(temperature, humidity);
             checkBatteryAlert(batteryVoltage, batteryPercentage);
+            if (sent) {
+                updateDeviceBatteryStatus(batteryVoltage, batteryPercentage, batteryStatus);
+            }
+
+            Serial.println("🔄 OTA: Checando atualização durante alerta...");
+            FirmwareInfo fwInfo = checkFirmwareUpdate();
+            if (fwInfo.available) {
+                float batPct = getBatteryPercentage(readBatteryVoltage());
+                if (canPerformUpdate(fwInfo, batPct, WiFi.RSSI())) {
+                    performOTAUpdate(fwInfo);
+                }
+            }
         }
         
         // 3. Entrar em loop de monitoramento contínuo
@@ -3633,6 +4006,9 @@ float performQuickReading()
         Serial.printf("📤 Reportando offset local %.1f°C ao servidor\n", tempOffset);
         reportOffsetToServer();
     }
+
+    Serial.println("\n[3F/6] 🔄 Sincronizando localização...");
+    syncDeviceLocationWithServer();
     
     yield();
     delay(500);
@@ -4085,6 +4461,8 @@ wifi_connected:
     Serial.println("   RSSI: " + String(WiFi.RSSI()) + " dBm");
     wifiWasEverConnected = true;
     consecutiveWifiFailures = 0;
+
+    validateOTAUpdate();
     
     // Sincronizar horário via NTP
     syncNTP();
