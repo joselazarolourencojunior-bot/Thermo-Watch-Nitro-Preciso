@@ -49,10 +49,13 @@
 #define BATTERY_PIN 34      // GPIO34 (ADC1_CH6) para leitura da bateria
 
 // MAX31865 (PT100 com precisão via SPI)
-// Pinos informados: SDI(MOSI)=GPIO19, CLK=SCK=GPIO18, CS=GPIO5
-// Necessário também SDO(MISO) do MAX31865 -> ESP32. Usando padrão VSPI: GPIO23
-#define MAX31865_MOSI_PIN 19
-#define MAX31865_MISO_PIN 23
+// Ligações confirmadas na sua placa:
+// - SDI (MOSI) -> GPIO23
+// - SDO (MISO) -> GPIO19
+// - SCLK       -> GPIO18
+// - CS         -> GPIO5
+#define MAX31865_MOSI_PIN 23
+#define MAX31865_MISO_PIN 19
 #define MAX31865_SCK_PIN 18
 #define MAX31865_CS_PIN 5
 
@@ -75,7 +78,7 @@
 #define TEMP_ALERT_INTERVAL 500        // Intervalo piscada (ms)
 
 // PT100
-#define TEMP_OFFSET 24.9      // Offset calibração (°C) - calibrado 27/01/2026: Real 26°C, Lido 1.1°C
+#define TEMP_OFFSET 0.0      // Offset calibração (°C) - padrão: 0.0
 
 // ========================================
 // ESTRUTURAS DE DADOS
@@ -126,6 +129,7 @@ void ledOff();
 void initLedTimer();
 void startLedBlink();
 void stopLedBlink();
+void setStatusLedAllowed(bool allowed);
 void IRAM_ATTR onLedTimer();
 String getISOTimestamp();
 float readBatteryVoltage();
@@ -160,6 +164,8 @@ String logUpdateAttempt(String fromVersion, String toVersion, String status, Str
 void updateLogStatus(String updateId, String status, String error, int duration, int bytes);
 bool performOTAUpdate(FirmwareInfo &info);
 void validateOTAUpdate();
+bool isMax31865DiagMode();
+void runMax31865Diagnostics();
 
 // Configurações Supabase (FIXAS - não precisam ser configuradas)
 const char *supabaseUrl = "https://qanyszslnactgtzpmtyj.supabase.co";
@@ -192,7 +198,7 @@ unsigned long lastGeoUpdate = 0;
 // MAX31865 + PT100
 // ========================================
 
-static SPISettings max31865SpiSettings(1000000, MSBFIRST, SPI_MODE1);
+static SPISettings max31865SpiSettings(500000, MSBFIRST, SPI_MODE1);
 
 static void max31865Select() { digitalWrite(MAX31865_CS_PIN, LOW); }
 static void max31865Deselect() { digitalWrite(MAX31865_CS_PIN, HIGH); }
@@ -240,20 +246,33 @@ static bool initMAX31865()
 
     SPI.begin(MAX31865_SCK_PIN, MAX31865_MISO_PIN, MAX31865_MOSI_PIN, MAX31865_CS_PIN);
 
-    uint8_t config = 0;
-    config |= 0x80;
-    config |= 0x40;
-    if (MAX31865_WIRES == 3) config |= 0x10;
-    config |= 0x00;
+    uint8_t modes[2] = {SPI_MODE1, SPI_MODE3};
+    for (int i = 0; i < 2; i++) {
+        max31865SpiSettings = SPISettings(500000, MSBFIRST, modes[i]);
 
-    max31865Write8(0x00, config);
-    delay(20);
-    max31865ClearFault();
+        uint8_t config = 0;
+        config |= 0x80;
+        config |= 0x40;
+        if (MAX31865_WIRES == 3) config |= 0x10;
+        config |= 0x00;
 
-    uint8_t readback = max31865Read8(0x00);
-    Serial.printf("✅ MAX31865 inicializado | Config=0x%02X | Pinos: MOSI=%d MISO=%d SCK=%d CS=%d\n",
-                  readback, MAX31865_MOSI_PIN, MAX31865_MISO_PIN, MAX31865_SCK_PIN, MAX31865_CS_PIN);
-    return true;
+        max31865Write8(0x00, config);
+        delay(30);
+        max31865ClearFault();
+        delay(10);
+
+        uint8_t readback = max31865Read8(0x00);
+        if (readback != 0x00 && readback != 0xFF) {
+            Serial.printf("✅ MAX31865 inicializado | SPI_MODE=%d | Config=0x%02X | Pinos: MOSI=%d MISO=%d SCK=%d CS=%d\n",
+                          modes[i], readback, MAX31865_MOSI_PIN, MAX31865_MISO_PIN, MAX31865_SCK_PIN, MAX31865_CS_PIN);
+            return true;
+        }
+
+        Serial.printf("⚠️ MAX31865 sem resposta | SPI_MODE=%d | Config=0x%02X\n", modes[i], readback);
+    }
+
+    Serial.println("❌ MAX31865 não respondeu. Verifique alimentação, GND e fios SPI (MISO/MOSI/SCK/CS).");
+    return false;
 }
 
 static uint16_t max31865ReadRTD()
@@ -326,6 +345,75 @@ float readPT100Temperature()
                   rtd, resistance, temperature, fault);
 
     return temperature;
+}
+
+bool isMax31865DiagMode()
+{
+    unsigned long windowStart = millis();
+    const unsigned long windowMs = 6000;
+    const unsigned long holdMs = 2000;
+
+    while (millis() - windowStart < windowMs) {
+        if (digitalRead(CONFIG_BUTTON_PIN) == LOW) {
+            unsigned long holdStart = millis();
+            while (digitalRead(CONFIG_BUTTON_PIN) == LOW && (millis() - holdStart < holdMs)) {
+                delay(25);
+            }
+            if (digitalRead(CONFIG_BUTTON_PIN) == LOW && (millis() - holdStart >= holdMs)) {
+                return true;
+            }
+        }
+        delay(25);
+    }
+
+    return false;
+}
+
+void runMax31865Diagnostics()
+{
+    Serial.println("\n🧪 MODO DIAGNÓSTICO MAX31865");
+    Serial.println("   Após reiniciar, aguarde o boot e segure BOOT por 2s (não segure durante o reset, para não entrar em modo download)");
+    Serial.println("   Para sair: segure BOOT por 3s para reiniciar\n");
+
+    bool ok = initMAX31865();
+    if (!ok) {
+        Serial.println("⚠️ Inicialização falhou. Continuando para testes de leitura.");
+    }
+
+    for (;;) {
+        uint8_t regs[8] = {0};
+        for (uint8_t i = 0; i < 8; i++) regs[i] = max31865Read8(i);
+
+        uint8_t rtdRaw[2] = {0, 0};
+        max31865ReadN(0x01, rtdRaw, 2);
+
+        uint16_t rtd = (uint16_t(rtdRaw[0]) << 8) | uint16_t(rtdRaw[1]);
+        rtd >>= 1;
+        float resistance = max31865RTDToResistance(rtd);
+        float temperature = max31865ResistanceToTemp(resistance);
+        uint8_t fault = regs[0x07];
+
+        Serial.printf("REGS: 00=%02X 01=%02X 02=%02X 03=%02X 04=%02X 05=%02X 06=%02X 07=%02X\n",
+                      regs[0], regs[1], regs[2], regs[3], regs[4], regs[5], regs[6], regs[7]);
+        Serial.printf("RTD_RAW=%02X %02X | RTD=%u | R=%.3fΩ | T=%.2f°C | fault=0x%02X\n",
+                      rtdRaw[0], rtdRaw[1], rtd, resistance, temperature, fault);
+
+        if (fault) {
+            max31865ClearFault();
+        }
+
+        unsigned long btnStart = millis();
+        while (digitalRead(CONFIG_BUTTON_PIN) == LOW) {
+            if (millis() - btnStart > 3000) {
+                Serial.println("🔄 Reiniciando...");
+                delay(100);
+                ESP.restart();
+            }
+            delay(25);
+        }
+
+        delay(1000);
+    }
 }
 
 // Variáveis configuráveis (salvas na EEPROM)
@@ -418,6 +506,7 @@ bool wifiWasEverConnected = false;               // Flag se já conectou alguma 
 hw_timer_t *ledTimer = NULL;
 volatile bool ledState = false;
 volatile bool ledBlinkEnabled = false;
+bool statusLedAllowed = false;
 
 // Callback para salvar configurações
 void saveConfigCallback()
@@ -877,6 +966,10 @@ void setup()
     pinMode(CONFIG_BUTTON_PIN, INPUT_PULLUP);
     pinMode(BATTERY_PIN, INPUT); // Configurar pino da bateria como entrada analógica
     digitalWrite(LED_PIN, LOW);
+
+    if (isMax31865DiagMode()) {
+        runMax31865Diagnostics();
+    }
     
     // Configurar sistema de alarme de temperatura
     pinMode(TEMP_ALERT_LED1, OUTPUT);
@@ -992,6 +1085,7 @@ void setup()
     Serial.println("💡 LED: ACESO FIXO durante configuração");
     
     // LED aceso durante todo o processo de configuração
+    setStatusLedAllowed(true);
     ledConfigMode();
     
     // Configurar WiFiManager
@@ -1167,6 +1261,8 @@ h1{text-align:center!important;color:#fff!important;margin-top:10px!important}
 void connectWiFi()
 {
     Serial.println("📡 Conectando ao WiFi...");
+    setStatusLedAllowed(true);
+    startLedBlink();
 
     String apName = FIRMWARE_VERSION;
 
@@ -1283,20 +1379,19 @@ bool testSupabaseConnection()
 {
     Serial.println("\n[3/4] Testando conexão com BD Supabase (5 tentativas)...");
     
-    String testUrl = String(supabaseUrl) + "/rest/v1/";
+    String testUrl = String(supabaseUrl) + "/auth/v1/health";
     
     for (int attempt = 1; attempt <= MAX_RETRY_ATTEMPTS; attempt++) {
         Serial.printf("   🔄 [%d/%d] Tentando conectar Supabase...\n", attempt, MAX_RETRY_ATTEMPTS);
         
         HTTPClient http;
         http.begin(testUrl);
-        http.addHeader("apikey", supabaseKey);
         http.setTimeout(8000);
         
         int httpCode = http.GET();
         String response = "";
         
-        if (httpCode > 0) {
+        if (httpCode == 200) {
             response = http.getString();
             Serial.printf("   ✅ Supabase conectado na tentativa %d | HTTP Code: %d\n", attempt, httpCode);
             Serial.printf("   📡 URL: %s\n", testUrl.c_str());
@@ -2227,6 +2322,9 @@ String formatUptime(unsigned long ms)
 // Função para piscar LED (indicações visuais)
 void blinkLED(int times, int delayMs)
 {
+    if (!statusLedAllowed) {
+        return;
+    }
     for (int i = 0; i < times; i++)
     {
         digitalWrite(LED_PIN, HIGH);
@@ -2244,9 +2342,12 @@ void blinkLED(int times, int delayMs)
 
 // Interrupção do timer para piscar LED
 void IRAM_ATTR onLedTimer() {
-    if (ledBlinkEnabled) {
+    if (ledBlinkEnabled && statusLedAllowed) {
         ledState = !ledState;
         digitalWrite(LED_PIN, ledState ? HIGH : LOW);
+    } else {
+        digitalWrite(LED_PIN, LOW);
+        ledState = false;
     }
 }
 
@@ -2277,9 +2378,20 @@ void stopLedBlink() {
     digitalWrite(LED_PIN, LOW);
 }
 
+void setStatusLedAllowed(bool allowed)
+{
+    statusLedAllowed = allowed;
+    if (!allowed) {
+        stopLedBlink();
+    }
+}
+
 // Liga ou desliga o LED
 void setLED(bool state)
 {
+    if (!statusLedAllowed) {
+        return;
+    }
     stopLedBlink(); // Garantir que não está piscando
     digitalWrite(LED_PIN, state ? HIGH : LOW);
 }
@@ -2287,19 +2399,21 @@ void setLED(bool state)
 // LED MODO CONFIGURAÇÃO: Aceso fixo
 void ledConfigMode()
 {
-    stopLedBlink(); // Parar qualquer piscada
-    digitalWrite(LED_PIN, HIGH);
+    startLedBlink();
 }
 
 // LED MODO OPERAÇÃO: Iniciar piscada rápida em background
 void ledOperationMode()
 {
-    startLedBlink(); // Iniciar piscada automática
+    ledOff();
 }
 
 // LED SUCESSO: Acende 2 segundos e apaga
 void ledSuccess()
 {
+    if (!statusLedAllowed) {
+        return;
+    }
     stopLedBlink(); // Parar piscada
     digitalWrite(LED_PIN, HIGH);
     delay(2000);
@@ -2309,6 +2423,9 @@ void ledSuccess()
 // LED FALHA: Pisca 2 vezes rápido e apaga
 void ledFailure()
 {
+    if (!statusLedAllowed) {
+        return;
+    }
     stopLedBlink(); // Parar piscada
     for (int i = 0; i < 2; i++) {
         digitalWrite(LED_PIN, HIGH);
@@ -2321,8 +2438,7 @@ void ledFailure()
 // LED OFF: Apaga o LED
 void ledOff()
 {
-    stopLedBlink(); // Parar piscada
-    digitalWrite(LED_PIN, LOW);
+    setStatusLedAllowed(false);
 }
 
 String getISOTimestamp()
@@ -3313,10 +3429,10 @@ float performQuickReading()
     bool isFinalWarning = (batteryVoltage <= BATTERY_FINAL_WARNING_VOLTAGE);
     
     // ===== ETAPA 0: LER SENSORES (ADC1 - funciona com WiFi) =====
-    Serial.println("\n[0/5] 🌡️ Lendo sensores (GPIO32 - ADC1)...");
-    Serial.println("✅ GPIO32 (ADC1) funciona independente do WiFi");
+    Serial.println("\n[0/5] 🌡️ Lendo PT100 (MAX31865 / SPI)...");
+    Serial.printf("✅ SPI pinos: MOSI=%d MISO=%d SCK=%d CS=%d\n", MAX31865_MOSI_PIN, MAX31865_MISO_PIN, MAX31865_SCK_PIN, MAX31865_CS_PIN);
     
-    // Ler PT100 (GPIO32 = ADC1 - funciona com WiFi ligado)
+    // Ler PT100
     float temperature = readPT100Temperature();
     float humidity = 0.0; // PT100 não mede umidade
     
@@ -3389,6 +3505,7 @@ float performQuickReading()
             ledFailure(); // 2 piscadas = falha
             WiFi.disconnect(true);
             WiFi.mode(WIFI_OFF);
+            ledOff();
             return 0.0; // Retorna 0 (falha) - irá para sleep
         }
     }
@@ -3434,9 +3551,10 @@ float performQuickReading()
         ledFailure(); // 2 piscadas = falha
         WiFi.disconnect(true);
         WiFi.mode(WIFI_OFF);
+        ledOff();
         return 0.0; // Retorna 0 (falha internet)
     }
-    ledOperationMode(); // Continua piscando
+    startLedBlink();
     
     // [3/4] TESTAR SUPABASE (5 tentativas, 15s)
     Serial.println("\n[3/4] Testando Supabase (5 tentativas)...");
@@ -3446,8 +3564,7 @@ float performQuickReading()
         Serial.printf("🔄 [%d/%d] Tentando conectar Supabase...\n", attempt, MAX_RETRY_ATTEMPTS);
         
         HTTPClient http;
-        http.begin(String(supabaseUrl) + "/rest/v1/");
-        http.addHeader("apikey", supabaseKey);
+        http.begin(String(supabaseUrl) + "/auth/v1/health");
         http.setTimeout(5000);
         int httpCode = http.GET();
         http.end();
@@ -3474,9 +3591,10 @@ float performQuickReading()
         ledFailure(); // 2 piscadas = falha
         WiFi.disconnect(true);
         WiFi.mode(WIFI_OFF);
+        ledOff();
         return 0.0; // Retorna 0 (falha supabase)
     }
-    ledOperationMode(); // Continua piscando
+    startLedBlink();
     
     // [3B/6] 🔍 VERIFICAR SE DISPOSITIVO ESTÁ CADASTRADO
     Serial.println("\n[3B/6] 🔍 Verificando cadastro do dispositivo...");
@@ -3492,6 +3610,7 @@ float performQuickReading()
         Serial.println("🚫 Dispositivo BLOQUEADO - entrando em sleep");
         WiFi.disconnect(true);
         WiFi.mode(WIFI_OFF);
+        ledOff();
         return 0.0; // Retorna 0 (dispositivo bloqueado)
     }
     yield();
@@ -3613,6 +3732,7 @@ float performQuickReading()
             Serial.println("💤 HIBERNANDO - recarregue bateria");
             WiFi.disconnect(true);
             WiFi.mode(WIFI_OFF);
+            ledOff();
             
             for (int i = 0; i < 10; i++) {
                 digitalWrite(LED_PIN, HIGH);
@@ -3707,6 +3827,7 @@ float performQuickReading()
     yield();
     
     WiFi.mode(WIFI_OFF);
+    ledOff();
     delay(1000);
     yield();
     
@@ -3749,6 +3870,7 @@ void monitorTemperatureUntilSafe(float initialTemp) {
         Serial.println("📴 Desconectando WiFi para economia durante alerta local...");
         WiFi.disconnect(true);
         WiFi.mode(WIFI_OFF);
+        ledOff();
     }
 
     float currentTemp = initialTemp;
@@ -3818,6 +3940,7 @@ void monitorTemperatureUntilSafe(float initialTemp) {
                 Serial.println("📴 Desconectando WiFi novamente...");
                 WiFi.disconnect(true);
                 WiFi.mode(WIFI_OFF);
+                ledOff();
             }
         }
         
@@ -3839,11 +3962,14 @@ bool connectWiFiQuick()
     // Desligar WiFi completamente antes de reconectar
     WiFi.disconnect(true);
     WiFi.mode(WIFI_OFF);
+    ledOff();
     delay(500);
     
     WiFi.mode(WIFI_STA);
     WiFi.setAutoReconnect(true);
     WiFi.persistent(true);
+    setStatusLedAllowed(true);
+    startLedBlink();
     
     // Primeiro: tentar scan para verificar se a rede está disponível
     String savedSSID = wm.getWiFiSSID();
@@ -3950,6 +4076,7 @@ bool connectWiFiQuick()
     }
     
     Serial.printf("❌ Falha na conexão WiFi após %d tentativas\n", MAX_RETRY_ATTEMPTS);
+    ledOff();
     return false;
     
 wifi_connected:
