@@ -351,14 +351,24 @@ float readPT100Resistance()
 float readPT100Temperature()
 {
     uint8_t fault = max31865Read8(0x07);
-    if (fault) {
-        Serial.printf("⚠️ MAX31865 fault=0x%02X (limpando)\n", fault);
-        max31865ClearFault();
+    uint16_t rtd = max31865ReadRTD();
+
+    if (fault || rtd == 0 || rtd >= 32760) {
+        if (fault) {
+            Serial.printf("⚠️ MAX31865 fault=0x%02X (limpando)\n", fault);
+            max31865ClearFault();
+        }
+        Serial.printf("❌ PT100 desconectado/erro (fault=0x%02X, rtd=%u)\n", fault, rtd);
+        return NAN;
     }
 
-    uint16_t rtd = max31865ReadRTD();
     float resistance = max31865RTDToResistance(rtd);
     float temperature = max31865ResistanceToTemp(resistance);
+
+    if (!isfinite(temperature)) {
+        Serial.printf("❌ PT100 leitura inválida (T não finita) | RTD=%u, R=%.3fΩ\n", rtd, resistance);
+        return NAN;
+    }
 
     Serial.printf("PT100/MAX31865 Debug: RTD=%u, R=%.3fΩ, T=%.2f°C, fault=0x%02X\n",
                   rtd, resistance, temperature, fault);
@@ -500,6 +510,37 @@ bool isSameVersion(String a, String b)
     return normalizeVersion(a) == normalizeVersion(b);
 }
 
+int compareVersions(String a, String b)
+{
+    a = normalizeVersion(a);
+    b = normalizeVersion(b);
+
+    int aStart = 0;
+    int bStart = 0;
+
+    for (int i = 0; i < 8; i++) {
+        int aDot = a.indexOf('.', aStart);
+        int bDot = b.indexOf('.', bStart);
+
+        String aPart = (aDot == -1) ? a.substring(aStart) : a.substring(aStart, aDot);
+        String bPart = (bDot == -1) ? b.substring(bStart) : b.substring(bStart, bDot);
+
+        int aNum = aPart.toInt();
+        int bNum = bPart.toInt();
+
+        if (aNum < bNum) return -1;
+        if (aNum > bNum) return 1;
+
+        if (aDot == -1 && bDot == -1) return 0;
+        if (aDot == -1) aStart = a.length();
+        else aStart = aDot + 1;
+        if (bDot == -1) bStart = b.length();
+        else bStart = bDot + 1;
+    }
+
+    return 0;
+}
+
 unsigned long getEpochNow()
 {
     time_t now = time(nullptr);
@@ -514,8 +555,14 @@ unsigned long getMillisNow()
 
 // Verificar se deve checar por atualizações OTA
 bool shouldCheckForUpdate() {
-    // Checar a CADA comunicação (toda vez que acorda do deep sleep)
-    Serial.println("🔄 OTA: Verificando atualização a cada comunicação");
+    static unsigned long lastCheckMs = 0;
+    unsigned long nowMs = millis();
+    if (lastCheckMs > 0 && (unsigned long)(nowMs - lastCheckMs) < 20000) {
+        return false;
+    }
+    lastCheckMs = nowMs;
+
+    Serial.println("🔄 OTA: Checando atualização");
     return true;
 }
 
@@ -590,8 +637,8 @@ FirmwareInfo checkFirmwareUpdate() {
                 info.min_battery = doc["min_battery"] | OTA_MIN_BATTERY;
                 info.min_rssi = doc["min_rssi"] | OTA_MIN_RSSI;
                 
-                // Comparar versões (redundância, já que a RPC deve filtrar)
-                if (!isSameVersion(info.version, CURRENT_FIRMWARE_VERSION)) {
+                int cmp = compareVersions(info.version, CURRENT_FIRMWARE_VERSION);
+                if (cmp > 0) {
                     String lastTarget = preferences.getString("ota_tgt", "");
                     unsigned long lastAttempt = preferences.getULong("ota_ts", 0);
                     int failures = preferences.getInt("ota_failures", 0);
@@ -622,7 +669,11 @@ FirmwareInfo checkFirmwareUpdate() {
                         Serial.println("⚠️  OTA: Atualização OBRIGATÓRIA!");
                     }
                 } else {
-                    Serial.println("✅ OTA: Versão retornada é a mesma da atual");
+                    if (cmp == 0) {
+                        Serial.println("✅ OTA: Versão retornada é a mesma da atual");
+                    } else {
+                        Serial.println("✅ OTA: Versão do servidor é menor/igual a atual");
+                    }
                 }
             } else {
                 Serial.println("✅ OTA: RPC diz que não há atualização disponível");
@@ -641,8 +692,8 @@ FirmwareInfo checkFirmwareUpdate() {
 
 // Validar se pode executar update
 bool canPerformUpdate(FirmwareInfo &info, float batteryPercentage, int rssi) {
-    if (isSameVersion(info.version, CURRENT_FIRMWARE_VERSION)) {
-        Serial.println("✅ OTA: Versão do servidor é igual a atual. Ignorando.");
+    if (compareVersions(info.version, CURRENT_FIRMWARE_VERSION) <= 0) {
+        Serial.println("✅ OTA: Versão do servidor não é maior que a atual. Ignorando.");
         return false;
     }
 
@@ -1707,11 +1758,18 @@ void loop()
     if (currentMillis - lastBlink > 5000)
     {
         float temp = readPT100Temperature();
-        Serial.printf("STATUS: WiFi=%s | Temp=%.1f°C | Bat=%.2fV | Uptime=%s\n",
-                     (WiFi.status() == WL_CONNECTED ? "OK" : "ERRO"),
-                     temp,
-                     readBatteryVoltage(),
-                     formatUptime(millis()).c_str());
+        if (isfinite(temp)) {
+            Serial.printf("STATUS: WiFi=%s | Temp=%.1f°C | Bat=%.2fV | Uptime=%s\n",
+                         (WiFi.status() == WL_CONNECTED ? "OK" : "ERRO"),
+                         temp,
+                         readBatteryVoltage(),
+                         formatUptime(millis()).c_str());
+        } else {
+            Serial.printf("STATUS: WiFi=%s | Temp=ERRO | Bat=%.2fV | Uptime=%s\n",
+                         (WiFi.status() == WL_CONNECTED ? "OK" : "ERRO"),
+                         readBatteryVoltage(),
+                         formatUptime(millis()).c_str());
+        }
         blinkLED(1, 100);
         lastBlink = currentMillis;
     }
@@ -2338,6 +2396,12 @@ void readAndSendSensorData()
     float resistance = max31865RTDToResistance(rtd);
     float temperature = max31865ResistanceToTemp(resistance);
     float humidity = 0.0; // PT100 não mede umidade
+
+    if (!isfinite(temperature) || rtd == 0 || rtd >= 32760 || max31865Read8(0x07)) {
+        Serial.println("❌ PT100 desconectado/erro - leitura descartada (não enviando)");
+        blinkLED(5, 200);
+        return;
+    }
     
     // ===== ALERTAS DE TEMPERATURA =====
     // Não ativa alertas em modo configuração - apenas em monitoramento contínuo
@@ -3794,12 +3858,16 @@ float performQuickReading()
     float temperature = readPT100Temperature();
     float humidity = 0.0; // PT100 não mede umidade
     
-    // SEMPRE enviar - sem validação de faixa
-    bool sensorOk = true;
+    bool sensorOk = isfinite(temperature);
+    if (!sensorOk) {
+        Serial.println("❌ PT100 desconectado/erro - ignorando leitura");
+    }
     
-    Serial.printf("🌡️ PT100: %.1f°C (sem validação - enviando direto)\n", temperature);
-    if (temperature < -200) {
-        Serial.println("❄️ MODO CRIOGÊNICO ativado (T < -200°C)");
+    if (sensorOk) {
+        Serial.printf("🌡️ PT100: %.1f°C (sem validação - enviando direto)\n", temperature);
+        if (temperature < -200) {
+            Serial.println("❄️ MODO CRIOGÊNICO ativado (T < -200°C)");
+        }
     }
     
     if (isFinalWarning) {
@@ -4252,8 +4320,9 @@ void monitorTemperatureUntilSafe(float initialTemp) {
     float currentTemp = initialTemp;
 
     while (true) {
-        // 1. Manter alertas visuais/sonoros ATIVOS continuamente
-        checkTemperatureAlerts(currentTemp); // Pisca LED/Buzzer conforme a zona
+        if (isfinite(currentTemp)) {
+            checkTemperatureAlerts(currentTemp);
+        }
         
         unsigned long now = millis();
         
@@ -4263,6 +4332,10 @@ void monitorTemperatureUntilSafe(float initialTemp) {
             
             // Leitura rápida do sensor
             currentTemp = readPT100Temperature();
+            if (!isfinite(currentTemp)) {
+                Serial.println("❌ PT100 desconectado/erro - monitoramento pausado");
+                continue;
+            }
             Serial.printf("🌡️ Monitoramento: %.1f°C\n", currentTemp);
             
             // SE NORMALIZOU (< -150°C): Sair do loop e permitir sleep
@@ -4303,7 +4376,9 @@ void monitorTemperatureUntilSafe(float initialTemp) {
                 }
 
                 Serial.println("📤 Reenviando dados de alerta...");
-                sendSensorData(currentTemp, 0.0);
+                if (isfinite(currentTemp)) {
+                    sendSensorData(currentTemp, 0.0);
+                }
                 
                 // Checar OTA também durante o alerta (opcional, mas bom para correções)
                 if (shouldCheckForUpdate()) {
