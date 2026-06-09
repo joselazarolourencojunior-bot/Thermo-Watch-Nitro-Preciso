@@ -167,7 +167,11 @@ bool performOTAUpdate(FirmwareInfo &info);
 void validateOTAUpdate();
 
 // Configurações Supabase (FIXAS - não precisam ser configuradas)
-#include "../include/secrets.h"
+#if defined(__has_include)
+#if __has_include("secrets.h")
+#include "secrets.h"
+#endif
+#endif
 
 #ifndef SUPABASE_ANON_KEY
 #define SUPABASE_ANON_KEY "YOUR_SUPABASE_ANON_KEY"
@@ -1298,6 +1302,15 @@ void loadSavedConfig()
 
     // Gerar ID único baseado no MAC address se não existir
     deviceId = preferences.getString("device_id", "");
+
+    auto buildDefaultDeviceId = []() -> String {
+        uint64_t mac = ESP.getEfuseMac();
+        uint16_t macHigh = (uint16_t)(mac >> 32);
+        uint32_t macLow = (uint32_t)mac;
+        char hex[13];
+        snprintf(hex, sizeof(hex), "%04X%08X", macHigh, macLow);
+        return String("ThermoWatch_") + String(hex);
+    };
     
     // Migração: Se o ID começa com "ESP32_", atualizar para "ThermoWatch_"
     if (deviceId.startsWith("ESP32_")) {
@@ -1306,12 +1319,24 @@ void loadSavedConfig()
         preferences.putString("device_id", deviceId);
         Serial.println("✅ Migração concluída: " + deviceId);
     }
+
+    {
+        const String prefix = "ThermoWatch_";
+        if (deviceId.startsWith(prefix)) {
+            String suffix = deviceId.substring(prefix.length());
+            if (suffix.length() == 6) {
+                Serial.println("🔄 Migrando device_id curto (24 bits) para ID completo (48 bits)...");
+                deviceId = buildDefaultDeviceId();
+                preferences.putString("device_id", deviceId);
+                Serial.println("✅ Migração concluída: " + deviceId);
+            }
+        }
+    }
     
     // Se não existe ID, criar novo com prefixo ThermoWatch_
     if (deviceId.length() == 0)
     {
-        deviceId = "ThermoWatch_" + WiFi.macAddress().substring(9); // Últimos 8 caracteres do MAC
-        deviceId.replace(":", "");
+        deviceId = buildDefaultDeviceId();
         preferences.putString("device_id", deviceId);
     }
 
