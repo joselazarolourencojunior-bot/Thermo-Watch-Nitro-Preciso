@@ -67,15 +67,16 @@
 #define MAX31865_WIRES 2
 
 // Sistema de alertas de temperatura - 3 ZONAS APENAS
-// ZONA 1: T < -150°C = NORMAL (pode dormir, sem alertas)
-// ZONA 2: -150°C ≤ T ≤ -120°C = ALERTA FRIO (LED1 pisca, não dorme)
-// ZONA 3: T > -120°C = ALERTA QUENTE (LED2+Buzzer, não dorme)
-#define TEMP_ALERT_LED1 15   // GPIO15 - LED de alerta frio (-150 a -120°C)
-#define TEMP_ALERT_LED2 16   // GPIO16 - LED de alerta quente (>-120°C)
-#define TEMP_ALERT_BUZZER 12 // GPIO12 - Buzzer (ativa junto com LED2 se T>-120°C)
-#define TEMP_LOW_THRESHOLD -150.0      // Início zona alerta frio (°C)
-#define TEMP_LOW_ALERT_THRESHOLD -120.0 // Fim zona alerta frio / início alerta quente (°C)
-#define TEMP_ALERT_INTERVAL 500        // Intervalo piscada (ms)
+// ZONA 1: T > 195.5°C = NORMAL (sem alertas)
+// ZONA 2: 193.5°C < T ≤ 195.5°C = ALERTA AMARELO (LED1 pisca, sem buzzer)
+// ZONA 3: T ≤ 193.5°C = ALERTA VERMELHO (LED2+Buzzer piscam)
+#define TEMP_ALERT_LED1 15   // GPIO15 - LED amarelo de alerta
+#define TEMP_ALERT_LED2 16   // GPIO16 - LED vermelho de alerta crítico
+#define TEMP_ALERT_BUZZER 12 // GPIO12 - Buzzer no alerta crítico
+#define TEMP_YELLOW_ALERT_THRESHOLD 195.5 // Início alerta amarelo (°C)
+#define TEMP_RED_ALERT_THRESHOLD 193.5    // Início alerta vermelho/crítico (°C)
+#define TEMP_ALERT_INTERVAL 500           // Intervalo piscada (ms)
+#define MAINS_POWER_MODE true               // Dispositivo ligado na rede elétrica 24h
 
 // PT100
 #define TEMP_OFFSET 0.0      // Offset calibração (°C) - padrão: 0.0
@@ -388,7 +389,7 @@ String deviceDescription;
 int readingIntervalSec = 3600; // Intervalo padrão: 60 minutos (em segundos)
 
 // ===== CONFIGURAÇÕES DE ECONOMIA DE ENERGIA =====
-// Modo bateria: intervalo configurável via WiFiManager (1-999 minutos)
+// Modo CA: intervalo configurável via WiFiManager (1-999 minutos)
 // readingIntervalSec armazena o intervalo em segundos (60 a 59940)
 const int MAX_RETRY_ATTEMPTS = 5; // Máximo 5 tentativas para qualquer conexão
 const int RETRY_INTERVAL_SECONDS = 15; // Intervalo de 15 segundos entre tentativas
@@ -1045,9 +1046,9 @@ void validateOTAUpdate() {
 
 /**
  * Verifica temperatura e ativa alertas visuais/sonoros
- * - T > 150°C: LED2 + Buzzer piscam (crítico)
- * - 120°C < T ≤ 150°C: APENAS LED1 pisca (elevado - sem buzzer)
- * - T ≤ 120°C: Todos desligados (normal)
+ * - T > 195.5°C: NORMAL (sem alertas)
+ * - 193.5°C < T ≤ 195.5°C: ALERTA AMARELO (LED1 pisca, sem buzzer)
+ * - T ≤ 193.5°C: ALERTA VERMELHO (LED2 + Buzzer piscam)
  * NUNCA os dois LEDs piscam juntos - lógica excludente
  */
 void checkTemperatureAlerts(float temperature) {
@@ -1055,13 +1056,8 @@ void checkTemperatureAlerts(float temperature) {
     static bool alertState = false;
     unsigned long currentMillis = millis();
     
-    // === 3 ZONAS DE TEMPERATURA ===
-    // ZONA 1: T < -150°C → NORMAL (sem alertas)
-    // ZONA 2: -150°C ≤ T ≤ -120°C → ALERTA FRIO (LED1)
-    // ZONA 3: T > -120°C → ALERTA QUENTE (LED2 + Buzzer)
-    
-    // ZONA 1: Temperatura NORMAL (< -150°C) - desliga IMEDIATAMENTE
-    if (temperature < TEMP_LOW_THRESHOLD) {
+    // ZONA 1: Temperatura NORMAL (> 195.5°C) - desliga alertas
+    if (temperature > TEMP_YELLOW_ALERT_THRESHOLD) {
         digitalWrite(TEMP_ALERT_LED1, LOW);
         digitalWrite(TEMP_ALERT_LED2, LOW);
         digitalWrite(TEMP_ALERT_BUZZER, LOW);
@@ -1073,26 +1069,26 @@ void checkTemperatureAlerts(float temperature) {
         lastToggle = currentMillis;
         alertState = !alertState;
         
-        // ZONA 2: ALERTA FRIO (-150°C ≤ T ≤ -120°C) - APENAS LED1 pisca
-        if (temperature >= TEMP_LOW_THRESHOLD && temperature <= TEMP_LOW_ALERT_THRESHOLD) {
+        // ZONA 2: ALERTA AMARELO (193.5°C < T ≤ 195.5°C) - APENAS LED1 pisca
+        if (temperature > TEMP_RED_ALERT_THRESHOLD) {
             digitalWrite(TEMP_ALERT_LED2, LOW);  // LED2 sempre desligado
             digitalWrite(TEMP_ALERT_BUZZER, LOW);  // Buzzer sempre desligado
             digitalWrite(TEMP_ALERT_LED1, alertState ? HIGH : LOW);
             
             if (alertState) {
-                Serial.printf("❄️ ALERTA FRIO: %.1f°C (%.0f a %.0f°C) - LED1 ATIVO\n", 
-                             temperature, TEMP_LOW_THRESHOLD, TEMP_LOW_ALERT_THRESHOLD);
+                Serial.printf("⚠️ ALERTA AMARELO: %.1f°C (%.1f a %.1f°C) - LED1 ATIVO\n", 
+                             temperature, TEMP_RED_ALERT_THRESHOLD, TEMP_YELLOW_ALERT_THRESHOLD);
             }
         }
-        // ZONA 3: ALERTA QUENTE (T > -120°C) - LED2 + Buzzer piscam juntos
-        else if (temperature > TEMP_LOW_ALERT_THRESHOLD) {
+        // ZONA 3: ALERTA VERMELHO (T ≤ 193.5°C) - LED2 + Buzzer piscam juntos
+        else {
             digitalWrite(TEMP_ALERT_LED2, alertState ? HIGH : LOW);
             digitalWrite(TEMP_ALERT_BUZZER, alertState ? HIGH : LOW);
             digitalWrite(TEMP_ALERT_LED1, LOW);  // LED1 sempre desligado
             
             if (alertState) {
-                Serial.printf("🚨 ALERTA QUENTE: %.1f°C (>%.0f°C) - LED2+BUZZER ATIVOS\n", 
-                             temperature, TEMP_LOW_ALERT_THRESHOLD);
+                Serial.printf("🚨 ALERTA VERMELHO: %.1f°C (≤ %.1f°C) - LED2+BUZZER ATIVOS\n", 
+                             temperature, TEMP_RED_ALERT_THRESHOLD);
             }
         }
     }
@@ -1103,14 +1099,14 @@ void setup()
     Serial.begin(115200);
     delay(100);
     
-    // ⚠️ VERIFICAÇÃO CRÍTICA: Verificar IMEDIATAMENTE se acordou de deep sleep
-    // ANTES de qualquer outra operação que possa consumir tempo
+    // ⚠️ VERIFICAÇÃO CRÍTICA: Se o código for reaproveitado de um firmware anterior,
+    // verificar a causa da inicialização antes de continuar.
     esp_sleep_wakeup_cause_t wakeup_reason = esp_sleep_get_wakeup_cause();
     bool isWakeFromSleep = (wakeup_reason == ESP_SLEEP_WAKEUP_TIMER || wakeup_reason == ESP_SLEEP_WAKEUP_EXT0);
     
     if (isWakeFromSleep) {
         Serial.println("\n💤 ========================================");
-        Serial.println("💤 ACORDOU DE DEEP SLEEP - MODO BATERIA");
+        Serial.println("💤 ACORDOU de reinício - compatibilidade com firmware anterior");
         Serial.println("💤 ========================================");
         Serial.println("✅ Reset counter será ZERADO (não é reset manual)\n");
         
@@ -1122,24 +1118,19 @@ void setup()
     }
     
     Serial.println();
-    Serial.println("🌡️ ThermoWatch ESP32 - Modo Bateria com Deep Sleep");
+    Serial.println("🌡️ ThermoWatch ESP32 - Modo CA contínuo 24h");
     Serial.println("====================================================================");
     
     // Mostrar razão do acordar e estatísticas
     Serial.println("DEBUG: Chamando showWakeupReason()...");
     Serial.flush();
     showWakeupReason();
-    
-    Serial.println("DEBUG: Chamando showBatteryStats()...");
-    Serial.flush();
-    showBatteryStats();
 
     // Configurar pinos
     Serial.println("DEBUG: Configurando pinos...");
     Serial.flush();
     pinMode(LED_PIN, OUTPUT);
     pinMode(CONFIG_BUTTON_PIN, INPUT_PULLUP);
-    pinMode(BATTERY_PIN, INPUT); // Configurar pino da bateria como entrada analógica
     digitalWrite(LED_PIN, LOW);
 
     // Configurar sistema de alarme de temperatura
@@ -1150,22 +1141,14 @@ void setup()
     digitalWrite(TEMP_ALERT_LED2, LOW);
     digitalWrite(TEMP_ALERT_BUZZER, LOW);
     Serial.println("🚨 Sistema de alarme de temperatura configurado:");
-    Serial.printf("   LED1 (GPIO%d): Frio %.0f a %.0f°C (sem buzzer)\n", 
-                  TEMP_ALERT_LED1, TEMP_LOW_THRESHOLD, TEMP_LOW_ALERT_THRESHOLD);
-    Serial.printf("   LED2 (GPIO%d) + Buzzer (GPIO%d): Quente >%.0f°C\n", 
-                  TEMP_ALERT_LED2, TEMP_ALERT_BUZZER, TEMP_LOW_ALERT_THRESHOLD);
+    Serial.printf("   LED1 (GPIO%d): Amarelo %.1f°C > T > %.1f°C (sem buzzer)\n", 
+                  TEMP_ALERT_LED1, TEMP_YELLOW_ALERT_THRESHOLD, TEMP_RED_ALERT_THRESHOLD);
+    Serial.printf("   LED2 (GPIO%d) + Buzzer (GPIO%d): Vermelho T ≤ %.1f°C\n", 
+                  TEMP_ALERT_LED2, TEMP_ALERT_BUZZER, TEMP_RED_ALERT_THRESHOLD);
     
-    // Configurar ADC (bateria)
-    analogSetAttenuation(ADC_11db);  // Faixa completa 0-3.3V
-    analogReadResolution(12);         // Resolução 12-bit (0-4095)
-    
+    // Em modo CA 24h, não é necessário monitorar bateria
     // Inicializar timer do LED
     initLedTimer();
-    
-    // Verificar status da bateria
-    Serial.println("DEBUG: Chamando displayBatteryInfo()...");
-    Serial.flush();
-    displayBatteryInfo();
 
     // Inicializar MAX31865 (PT100 via SPI)
     Serial.println("DEBUG: Inicializando MAX31865 (PT100 via SPI)...");
@@ -1213,46 +1196,44 @@ void setup()
     WiFi.mode(WIFI_STA);
     wm.setClass("invert");
 
-    // MODO BATERIA: Fazer leitura rápida e dormir
+    // MODO CA/24h: Fazer leitura rápida e operar continuamente
     if (!isConfigMode()) 
     {
-        // Piscar LED para indicar acordar
+        // Piscar LED para indicar inicialização
         blinkLED(1, 100);
         
         // Fazer medição rápida com 5 tentativas em cada passo
         float currentTemp = performQuickReading();
         
         // VERIFICAR SE TEMPERATURA ESTÁ EM ZONA DE ALERTA
-        // Zona alerta FRIO: -150°C a -120°C (LED1)
-        // Zona alerta QUENTE: > -120°C (LED2+Buzzer)
-        bool isInAlertZone = (currentTemp >= TEMP_LOW_THRESHOLD);
+        // Zona alerta AMARELA: 193.5°C < T ≤ 195.5°C (LED1)
+        // Zona alerta VERMELHA: T ≤ 193.5°C (LED2+Buzzer)
+        bool isInAlertZone = (currentTemp <= TEMP_YELLOW_ALERT_THRESHOLD);
         
         if (isInAlertZone) {
             Serial.println("\n🚨 ════════════════════════════════════════════════════");
-            if (currentTemp > TEMP_LOW_ALERT_THRESHOLD) {
-                Serial.printf("🚨  TEMPERATURA QUENTE EM ALERTA: %.1f°C (>%.0f°C)\n", 
-                             currentTemp, TEMP_LOW_ALERT_THRESHOLD);
+            if (currentTemp <= TEMP_RED_ALERT_THRESHOLD) {
+                Serial.printf("🚨  TEMPERATURA VERMELHA EM ALERTA: %.1f°C (≤ %.1f°C)\n", 
+                             currentTemp, TEMP_RED_ALERT_THRESHOLD);
             } else {
-                Serial.printf("❄️  TEMPERATURA FRIA EM ALERTA: %.1f°C (%.0f a %.0f°C)\n", 
-                             currentTemp, TEMP_LOW_THRESHOLD, TEMP_LOW_ALERT_THRESHOLD);
+                Serial.printf("⚠️  TEMPERATURA AMARELA EM ALERTA: %.1f°C (%.1f a %.1f°C)\n", 
+                             currentTemp, TEMP_RED_ALERT_THRESHOLD, TEMP_YELLOW_ALERT_THRESHOLD);
             }
             Serial.println("🚨  ESP32 PERMANECERÁ ACORDADO até normalizar!");
-            Serial.println("🚨  Sleep CANCELADO - Monitoramento contínuo ativo");
+            Serial.println("🚨  Operação contínua 24h ativada");
             Serial.println("🚨 ════════════════════════════════════════════════════\n");
             
             // Entrar em loop de monitoramento contínuo até temperatura normalizar
             monitorTemperatureUntilSafe(currentTemp);
         }
         
-        // Temperatura normal (< -150°C) - pode dormir
-        Serial.println("✅ Temperatura normal - prosseguindo para sleep");
-        
-        // Configurar timer para acordar em 4 horas
-        enterDeepSleep();
+        Serial.println("✅ Temperatura normal - operando continuamente 24h");
+        Serial.println("🔌 Modo CA ativo: operação contínua 24h");
+        return;
     }
     
     // Se chegou aqui, está em modo configuração contínua
-    Serial.println("📋 Modo Configuração ativo - funcionamento contínuo (sleep desabilitado)");
+    Serial.println("📋 Modo Configuração ativo - funcionamento contínuo (sem hibernação)");
     Serial.println("💡 LED: ACESO FIXO durante configuração");
     
     // LED aceso durante todo o processo de configuração
@@ -1681,8 +1662,8 @@ void performConnectivityTests()
 
 void loop()
 {
-    // ⚠️ ATENÇÃO: Em modo bateria, o ESP32 não deve chegar aqui
-    // Se chegou, significa que está em modo configuração
+    // ⚠️ ATENÇÃO: Neste ponto, o ESP32 só deve chegar no modo configuração
+    // quando o portal WiFi estiver ativo.
     
     unsigned long currentMillis = millis();
     
@@ -1784,15 +1765,13 @@ void loop()
     {
         float temp = readPT100Temperature();
         if (isfinite(temp)) {
-            Serial.printf("STATUS: WiFi=%s | Temp=%.1f°C | Bat=%.2fV | Uptime=%s\n",
+            Serial.printf("STATUS: WiFi=%s | Temp=%.1f°C | Uptime=%s\n",
                          (WiFi.status() == WL_CONNECTED ? "OK" : "ERRO"),
                          temp,
-                         readBatteryVoltage(),
                          formatUptime(millis()).c_str());
         } else {
-            Serial.printf("STATUS: WiFi=%s | Temp=ERRO | Bat=%.2fV | Uptime=%s\n",
+            Serial.printf("STATUS: WiFi=%s | Temp=ERRO | Uptime=%s\n",
                          (WiFi.status() == WL_CONNECTED ? "OK" : "ERRO"),
-                         readBatteryVoltage(),
                          formatUptime(millis()).c_str());
         }
         blinkLED(1, 100);
@@ -2094,10 +2073,10 @@ void updateDeviceBatteryStatus(float batteryVoltage, float batteryPercentage, St
     doc["battery_voltage"] = batteryVoltage;
     doc["battery_percentage"] = (int)batteryPercentage;
     doc["battery_status"] = batteryStatus;
-    doc["battery_low_alert"] = (batteryVoltage <= BATTERY_LOW_VOLTAGE);
-    doc["battery_critical_alert"] = (batteryVoltage <= BATTERY_CRITICAL_VOLTAGE);
+    doc["battery_low_alert"] = false;
+    doc["battery_critical_alert"] = false;
     doc["last_battery_check"] = getISOTimestamp();
-    doc["power_mode"] = "BATTERY";
+    doc["power_mode"] = "MAINS";
     doc["signal_strength"] = WiFi.RSSI();
 
     String loc = deviceLocation;
@@ -2188,7 +2167,7 @@ bool checkDeviceEnabled()
             {
                 Serial.println("🚫 ═══════════════════════════════════════════════════=");
                 Serial.println("🚫  DISPOSITIVO BLOQUEADO PELO ADMINISTRADOR!");
-                Serial.printf("🚫  Entrando em deep sleep por %d minutos...\n", readingIntervalSec / 60);
+                Serial.printf("🚫  Ciclo suspenso por %d minutos... (não usado em modo CA)\n", readingIntervalSec / 60);
                 Serial.println("🚫 ═══════════════════════════════════════════════════=");
                 
                 // 3 piscadas demoradas = sinal de bloqueio
@@ -2485,7 +2464,7 @@ void readAndSendSensorData()
     if (!checkDeviceEnabled()) {
         Serial.println("⛔ Dispositivo DESABILITADO no servidor.");
         // Se estiver desabilitado, não envia dados e retorna
-        // O loop principal ou setup cuidará do deep sleep
+        // O loop principal ou setup cuidará da operação contínua
         return; 
     }
 
@@ -2573,7 +2552,7 @@ void readAndSendSensorData()
     rawData["uptime_ms"] = millis();
     rawData["reading_interval"] = readingIntervalSec;
     
-    // Dados da bateria
+    // Dados da bateria / energia
     float batteryVoltage = readBatteryVoltage();
     float batteryPercentage = getBatteryPercentage(batteryVoltage);
     String batteryStatus = getBatteryStatus(batteryVoltage, batteryPercentage);
@@ -2581,8 +2560,9 @@ void readAndSendSensorData()
     rawData["battery_voltage"] = batteryVoltage;
     rawData["battery_percentage"] = batteryPercentage;
     rawData["battery_status"] = batteryStatus;
-    rawData["battery_low_alert"] = (batteryVoltage <= BATTERY_LOW_VOLTAGE);
-    rawData["battery_critical_alert"] = (batteryVoltage <= BATTERY_CRITICAL_VOLTAGE);
+    rawData["battery_low_alert"] = false;
+    rawData["battery_critical_alert"] = false;
+    rawData["power_mode"] = "MAINS";
     rawData["debug_mode"] = true;
 
     String jsonString;
@@ -2692,10 +2672,10 @@ void sendHeartbeat()
     doc["battery_voltage"] = batteryVoltage;
     doc["battery_percentage"] = (int)batteryPercentage;
     doc["battery_status"] = batteryStatus;
-    doc["battery_low_alert"] = (batteryVoltage <= BATTERY_LOW_VOLTAGE);
-    doc["battery_critical_alert"] = (batteryVoltage <= BATTERY_CRITICAL_VOLTAGE);
+    doc["battery_low_alert"] = false;
+    doc["battery_critical_alert"] = false;
     doc["last_battery_check"] = getISOTimestamp();
-    doc["power_mode"] = "BATTERY";
+    doc["power_mode"] = "MAINS";
 
     // Metadados do sistema
     JsonObject metadata = doc.createNestedObject("metadata");
@@ -2952,41 +2932,13 @@ void syncNTP()
 
 float readBatteryVoltage()
 {
-    // Fazer múltiplas leituras para média mais precisa
-    float totalVoltage = 0;
-    int rawSum = 0;
-    
-    for (int i = 0; i < BATTERY_SAMPLES; i++) 
-    {
-        int rawValue = analogRead(BATTERY_PIN);
-        rawSum += rawValue;
-        float voltage = (rawValue * 3.3) / 4096.0; // ADC de 12 bits, referência 3.3V
-        voltage *= VOLTAGE_DIVIDER_RATIO; // Aplicar divisor de tensão (1.0 = sem divisor)
-        voltage *= BATTERY_CALIBRATION_FACTOR; // Aplicar calibração fina
-        totalVoltage += voltage;
-        delay(10); // Pequeno delay entre leituras
-    }
-    
-    float avgRaw = rawSum / (float)BATTERY_SAMPLES;
-    float avgADC = (avgRaw * 3.3) / 4096.0;
-    float finalVoltage = totalVoltage / BATTERY_SAMPLES;
-    
-    // Detectar saturação do ADC (bateria acima de 3.3V)
-    bool adcSaturated = (avgRaw >= 4090);
-    
-    // DEBUG DETALHADO: mostrar raw ADC, tensão ADC e tensão calculada
-    Serial.printf("🔋 ADC Raw: %.0f | ADC Voltage: %.3fV | Bateria: %.2fV%s\n", 
-                  avgRaw, avgADC, finalVoltage,
-                  adcSaturated ? " (ADC SATURADO - bateria cheia)" : "");
-    Serial.printf("   Calibração: %.4f | Alimentação: %s\n", 
-                  BATTERY_CALIBRATION_FACTOR,
-                  (avgRaw < 50) ? "USB (sem bateria)" : "Bateria");
-    
-    return finalVoltage;
+    // Modo CA 24h: não monitora bateria
+    return 0.0;
 }
 
 float getBatteryPercentage(float voltage)
 {
+    if (MAINS_POWER_MODE) return 100.0;
     // Calcular porcentagem baseada na curva de descarga Li-Ion
     if (voltage >= BATTERY_MAX_VOLTAGE) return 100.0;
     if (voltage <= BATTERY_MIN_VOLTAGE) return 0.0;
@@ -2998,6 +2950,10 @@ float getBatteryPercentage(float voltage)
 
 String getBatteryStatus(float voltage, float percentage)
 {
+    if (MAINS_POWER_MODE) {
+        return "MAINS";
+    }
+
     if (voltage <= BATTERY_CRITICAL_VOLTAGE) {
         return "CRÍTICA";
     } else if (voltage <= BATTERY_LOW_VOLTAGE) {
@@ -3129,6 +3085,10 @@ bool checkWiFiSignalAlert(int rssi)
 
 bool checkBatteryAlert(float voltage, float percentage)
 {
+    if (MAINS_POWER_MODE) {
+        Serial.println("ℹ️ Modo CA 24h - alertas de bateria desabilitados");
+        return true;
+    }
     // Detectar se está alimentado por USB (sem bateria conectada)
     // ADC raw < 50 (< 0.04V) indica que não há bateria
     int rawTest = analogRead(BATTERY_PIN);
@@ -3295,34 +3255,30 @@ bool sendSensorData(float temperature, float humidity)
     doc["timestamp"] = getISOTimestamp();
     doc["sensor_type"] = "PT100";
 
-    // Dados da bateria como colunas principais
-    float batteryVoltage = readBatteryVoltage();
-    float batteryPercentage = getBatteryPercentage(batteryVoltage);
-    String batteryStatus = getBatteryStatus(batteryVoltage, batteryPercentage);
-    
-    doc["battery_voltage"] = batteryVoltage;
-    doc["battery_percentage"] = batteryPercentage;
-    doc["battery_status"] = batteryStatus;
+    // Dados de energia em modo CA 24h
+    doc["battery_voltage"] = 0.0;
+    doc["battery_percentage"] = 0;
+    doc["battery_status"] = "MAINS";
 
-    // Dados técnicos incluindo bateria e qualidade WiFi
+    // Dados técnicos incluindo qualidade WiFi
     JsonObject rawData = doc.createNestedObject("raw_data");
     int rssi = WiFi.RSSI();
     rawData["wifi_rssi"] = rssi;
     rawData["wifi_quality"] = getWiFiSignalQuality(rssi);  // EXCELENTE, BOM, FRACO, etc.
     rawData["free_heap"] = ESP.getFreeHeap();
     rawData["uptime_ms"] = millis();
-    rawData["reading_interval"] = readingIntervalSec; // Intervalo configurável em modo bateria
+    rawData["reading_interval"] = readingIntervalSec; // Intervalo configurável via WiFiManager
     
     // ID único de transação para evitar duplicatas em caso de retry
-    // Formato: deviceId_sleepCount_uptimeMs (único por ciclo de acordar)
+    // Formato: deviceId_cycleCount_uptimeMs (único por ciclo de acordar)
     unsigned long sleepCount = preferences.getULong("sleep_count", 0);
     String transactionId = deviceId + "_" + String(sleepCount) + "_" + String(millis());
     rawData["transaction_id"] = transactionId;
     
-    rawData["battery_low_alert"] = (batteryVoltage <= BATTERY_LOW_VOLTAGE);
-    rawData["battery_critical_alert"] = (batteryVoltage <= BATTERY_CRITICAL_VOLTAGE);
+    rawData["battery_low_alert"] = false;
+    rawData["battery_critical_alert"] = false;
     rawData["wifi_weak_alert"] = (rssi <= WIFI_RSSI_WEAK);  // Alerta se sinal fraco
-    rawData["power_mode"] = "BATTERY"; // Indicar que está em modo bateria
+    rawData["power_mode"] = "MAINS"; // Indicar que está em modo CA 24h
 
     String jsonString;
     serializeJson(doc, jsonString);
@@ -3331,8 +3287,7 @@ bool sendSensorData(float temperature, float humidity)
     bool success = (httpResponseCode == 201);
 
     if (success) {
-        Serial.printf("✅ Dados enviados: %.1f°C, %.1f%%, %.2fV (%.1f%%)\n", 
-                      temperature, humidity, batteryVoltage, batteryPercentage);
+        Serial.printf("✅ Dados enviados: %.1f°C | Modo: MAINS\n", temperature);
         Serial.printf("   Transaction ID: %s\n", transactionId.c_str());
     } else {
         // Log detalhado para diagnóstico de problemas
@@ -3364,6 +3319,11 @@ bool sendSensorData(float temperature, float humidity)
  */
 bool sendFinalBatteryNotification(float temperature, float humidity, float batteryVoltage)
 {
+    if (MAINS_POWER_MODE) {
+        Serial.println("ℹ️ Modo CA 24h - notificação final de bateria não aplicável");
+        return false;
+    }
+
     Serial.println("\n🚨 ════════════════════════════════════════════════════");
     Serial.println("🚨  ENVIANDO NOTIFICAÇÃO FINAL DE BATERIA");
     Serial.println("🚨 ════════════════════════════════════════════════════\n");
@@ -3734,7 +3694,7 @@ bool syncDeviceGeolocation()
 }
 
 // ============================================================================
-// 🔋 FUNÇÕES DO MODO BATERIA (DEEP SLEEP)
+// 🔋 FUNÇÕES DE SUPORTE LEGADO DE ENERGIA / COMPATIBILIDADE
 // ============================================================================
 
 void showWakeupReason()
@@ -3772,15 +3732,15 @@ void showBatteryStats()
     
     if (sleepCount > 0) 
     {
-        Serial.println("📊 Estatísticas do Modo Bateria:");
-        Serial.println("   Ciclos de sleep: " + String(sleepCount));
+        Serial.println("📊 Estatísticas de energia / compatibilidade:");
+        Serial.println("   Ciclos de operação: " + String(sleepCount));
         int cyclesPerDay = 1440 / (readingIntervalSec / 60); // Ciclos por dia baseado no intervalo
         Serial.println("   Dias funcionando: " + String(sleepCount / cyclesPerDay));
         Serial.println("   Consumo estimado: " + String(sleepCount * 0.08) + " mAh");
         
-        // Calcular próximo sleep
-        Serial.println("   Próximo sleep: em ~60 segundos");
-        Serial.println("   Duração sleep: " + String(readingIntervalSec / 60) + " minutos (" + String(readingIntervalSec) + "s)");
+        // Calcular próximo ciclo
+        Serial.println("   Próximo ciclo: em ~60 segundos");
+        Serial.println("   Duração do ciclo: " + String(readingIntervalSec / 60) + " minutos (" + String(readingIntervalSec) + "s)");
     }
 }
 
@@ -3823,13 +3783,13 @@ bool isConfigMode()
         return true;
     }
     
-    Serial.println("🔋 WiFi configurado e botão não pressionado - Modo Bateria (com sleep)");
+    Serial.println("🔋 WiFi configurado e botão não pressionado - Modo CA 24h");
     return false;
 }
 
 float performQuickReading()
 {
-    Serial.println("\n🔋 === MODO BATERIA: LEITURA RÁPIDA ===");
+    Serial.println("\n� === MODO CA 24h: LEITURA RÁPIDA ===");
     
     // ===== VERIFICAÇÃO ADICIONAL DO BOTÃO =====
     // Dar uma última chance para o usuário pressionar o botão antes de iniciar
@@ -3863,17 +3823,14 @@ float performQuickReading()
     // Iniciar LED piscando automaticamente
     ledOperationMode();
     
-    // ===== LER VARIÁVEIS DE ESTADO (Bateria, etc) =====
+    // ===== LER VARIÁVEIS DE ESTADO =====
     float batteryVoltage = readBatteryVoltage();
     float batteryPercentage = getBatteryPercentage(batteryVoltage);
     String batteryStatus = getBatteryStatus(batteryVoltage, batteryPercentage);
     
-    // Flag para indicar bateria crítica (mas continuar enviando alerta)
-    bool isCriticalBattery = (batteryVoltage <= BATTERY_CRITICAL_VOLTAGE && batteryVoltage > BATTERY_FINAL_WARNING_VOLTAGE);
-    
-    // ===== MODO ÚLTIMO AVISO: Bateria em 2.5V =====
-    // Envia 4 leituras consecutivas e depois hiberna até recarregar
-    bool isFinalWarning = (batteryVoltage <= BATTERY_FINAL_WARNING_VOLTAGE);
+    // Em modo CA 24h, não há alertas nem hibernação de bateria
+    bool isCriticalBattery = false;
+    bool isFinalWarning = false;
     
     // ===== ETAPA 0: LER SENSORES (ADC1 - funciona com WiFi) =====
     Serial.println("\n[0/5] 🌡️ Lendo PT100 (MAX31865 / SPI)...");
@@ -3895,19 +3852,12 @@ float performQuickReading()
         }
     }
     
-    if (isFinalWarning) {
-        Serial.println("\n🚨 ════════════════════════════════════════════════════");
-        Serial.println("🚨  BATERIA MUITO BAIXA (2.5V) - MODO ÚLTIMO AVISO!");
-        Serial.println("🚨  Serão enviadas 4 leituras e depois HIBERNAÇÃO");
-        Serial.println("🚨 ════════════════════════════════════════════════════\n");
-    } else if (isCriticalBattery) {
-        Serial.println("⚠️ BATERIA CRÍTICA - Enviando alerta antes de sleep");
-    }
+    // Em modo CA 24h, não há alertas de bateria nem hibernação por carga baixa.
     
     // ===== ALERTAS DE TEMPERATURA E LÓGICA DE ENVIO CONTÍNUO =====
-    // Se a temperatura estiver ALTA (Zona 3: > -120°C), entrar em modo de alerta contínuo
-    if (temperature > TEMP_LOW_ALERT_THRESHOLD) {
-        Serial.println("\n🚨 ALERTA DE TEMPERATURA ALTA DETECTADO!");
+    // Se a temperatura estiver CRÍTICA (Zona 3: ≤ 193.5°C), entrar em modo de alerta contínuo
+    if (temperature <= TEMP_RED_ALERT_THRESHOLD) {
+        Serial.println("\n🚨 ALERTA DE TEMPERATURA CRÍTICA DETECTADO!");
         Serial.println("🚨 Iniciando ciclo de envio contínuo e alerta sonoro/visual...");
         
         // 1. Conectar WiFi (se não estiver conectado)
@@ -3942,10 +3892,10 @@ float performQuickReading()
         monitorTemperatureUntilSafe(temperature);
         
         // 4. Quando retornar de monitorTemperatureUntilSafe, significa que normalizou
-        // O código seguirá para o fluxo normal de sleep abaixo
+        // O código seguirá para o fluxo normal abaixo
     } else {
         // Temperatura normal ou zona de alerta frio (apenas LED1)
-        // Segue fluxo padrão de envio único e sleep
+        // Segue fluxo padrão de envio único
         Serial.println("✅ Temperatura em nível seguro ou alerta frio (sem envio contínuo)");
     }
     
@@ -3967,12 +3917,12 @@ float performQuickReading()
         
         if (!connectWiFiQuick()) 
         {
-            Serial.println("❌ [1/4] WiFi FALHOU após 5 tentativas - entrando em sleep");
+            Serial.println("❌ [1/4] WiFi FALHOU após 5 tentativas - encerrando ciclo");
             ledFailure(); // 2 piscadas = falha
             WiFi.disconnect(true);
             WiFi.mode(WIFI_OFF);
             ledOff();
-            return 0.0; // Retorna 0 (falha) - irá para sleep
+            return 0.0; // Retorna 0 (falha) - encerra ciclo
         }
     }
     
@@ -4013,7 +3963,7 @@ float performQuickReading()
     }
     
     if (!internetOk) {
-        Serial.println("❌ [2/4] Internet FALHOU após 5 tentativas - entrando em sleep");
+        Serial.println("❌ [2/4] Internet FALHOU após 5 tentativas - encerrando ciclo");
         ledFailure(); // 2 piscadas = falha
         WiFi.disconnect(true);
         WiFi.mode(WIFI_OFF);
@@ -4053,7 +4003,7 @@ float performQuickReading()
     }
     
     if (!supabaseOk) {
-        Serial.println("❌ [3/4] Supabase FALHOU após 5 tentativas - entrando em sleep");
+        Serial.println("❌ [3/4] Supabase FALHOU após 5 tentativas - encerrando ciclo");
         ledFailure(); // 2 piscadas = falha
         WiFi.disconnect(true);
         WiFi.mode(WIFI_OFF);
@@ -4073,7 +4023,7 @@ float performQuickReading()
     // [3C/6] 📋 VERIFICAR SE DISPOSITIVO ESTÁ HABILITADO
     Serial.println("\n[3C/6] 📋 Verificando se dispositivo está habilitado...");
     if (!checkDeviceEnabled()) {
-        Serial.println("🚫 Dispositivo BLOQUEADO - entrando em sleep");
+        Serial.println("🚫 Dispositivo BLOQUEADO - encerrando ciclo");
         WiFi.disconnect(true);
         WiFi.mode(WIFI_OFF);
         ledOff();
@@ -4198,7 +4148,7 @@ float performQuickReading()
                 }
             }
             
-            Serial.println("💤 HIBERNANDO - recarregue bateria");
+            Serial.println("⚠️ MODO ÚLTIMO AVISO - recarregue bateria");
             WiFi.disconnect(true);
             WiFi.mode(WIFI_OFF);
             ledOff();
@@ -4210,7 +4160,7 @@ float performQuickReading()
                 delay(100);
             }
             
-            Serial.println("💤 Hibernação ativada");
+            Serial.println("⚠️ Modo crítico ativado");
             Serial.flush();
             
             esp_sleep_disable_wakeup_source(ESP_SLEEP_WAKEUP_TIMER);
@@ -4285,7 +4235,7 @@ float performQuickReading()
         }
     }
     
-    // ===== FINALIZAÇÃO: Desconectar WiFi e preparar para sleep =====
+    // ===== FINALIZAÇÃO: Desconectar WiFi e preparar para próxima iteração =====
     yield();
     Serial.println("\n📴 Desconectando WiFi para economizar energia...");
     Serial.flush();
@@ -4305,43 +4255,32 @@ float performQuickReading()
     delay(500);
     yield();
     
-    Serial.println("\n✅ Sequência completa - pronto para sleep");
+    Serial.println("\n✅ Sequência completa - pronto para continuar operação");
     Serial.flush();
     delay(500);
     yield();
     
-    Serial.println("🔄 Retornando temperatura para verificação de sleep...");
+    Serial.println("🔄 Retornando temperatura para verificação de operação...");
     Serial.flush();
     delay(500);
     yield();
     
-    return temperature; // Retorna temperatura para decisão de sleep
+    return temperature; // Retorna temperatura para decisão de operação
 }
 
 void monitorTemperatureUntilSafe(float initialTemp) {
     Serial.println("🔄 ALERTA ATIVO: Monitoramento contínuo iniciado...");
-    Serial.println("✅ Retornará ao sleep APENAS quando T < -150°C");
+    Serial.printf("✅ Retornará ao modo normal quando T > %.1f°C\n", TEMP_YELLOW_ALERT_THRESHOLD);
     
     // Configurações do ciclo de alerta
     const unsigned long RECHECK_INTERVAL = 30000; // 30 segundos entre leituras do sensor
-    // USAR INTERVALO CONFIGURADO NO DISPOSITIVO/SERVIDOR PARA REENVIO (readingIntervalSec)
-    // Se o intervalo for muito curto (< 5 min), forçar mínimo de 5 min para evitar flood
-    unsigned long resendIntervalMs = readingIntervalSec * 1000;
+    unsigned long resendIntervalMs = readingIntervalSec * 1000UL;
     if (resendIntervalMs < 300000) resendIntervalMs = 300000; // Mínimo 5 minutos em alerta
     
     Serial.printf("⏱️ Intervalo de reenvio configurado para: %lu minutos\n", resendIntervalMs / 60000);
     
     unsigned long lastCheck = 0;
-    unsigned long lastSend = millis(); // Já enviou o inicial antes de entrar aqui
-    
-    // Desconectar WiFi para economizar bateria enquanto apenas monitora/alerta localmente
-    if (WiFi.status() == WL_CONNECTED) {
-        Serial.println("📴 Desconectando WiFi para economia durante alerta local...");
-        WiFi.disconnect(true);
-        WiFi.mode(WIFI_OFF);
-        ledOff();
-    }
-
+    unsigned long lastSend = millis(); // já enviou o inicial antes de entrar aqui
     float currentTemp = initialTemp;
 
     while (true) {
@@ -4350,78 +4289,61 @@ void monitorTemperatureUntilSafe(float initialTemp) {
         }
         
         unsigned long now = millis();
-        
-        // 2. A cada 30s: Ler sensor novamente
+
+        if (WiFi.status() != WL_CONNECTED) {
+            Serial.println("📡 WiFi desconectado durante alerta - tentando reconectar...");
+            connectWiFiQuick();
+        }
+
         if (now - lastCheck >= RECHECK_INTERVAL) {
             lastCheck = now;
-            
-            // Leitura rápida do sensor
             currentTemp = readPT100Temperature();
             if (!isfinite(currentTemp)) {
                 Serial.println("❌ PT100 desconectado/erro - monitoramento pausado");
-                continue;
-            }
-            Serial.printf("🌡️ Monitoramento: %.1f°C\n", currentTemp);
-            
-            // SE NORMALIZOU (< -150°C): Sair do loop e permitir sleep
-            if (currentTemp < TEMP_LOW_THRESHOLD) {
-                Serial.println("✅ TEMPERATURA NORMALIZADA! Encerrando alerta.");
-                
-                // Desligar alertas
-                digitalWrite(TEMP_ALERT_LED1, LOW);
-                digitalWrite(TEMP_ALERT_LED2, LOW);
-                digitalWrite(TEMP_ALERT_BUZZER, LOW);
-                
-                // Enviar leitura final de normalização
-                connectWiFiQuick();
-                if (WiFi.status() == WL_CONNECTED) {
-                    Serial.println("📤 Enviando leitura de normalização...");
-                    sendSensorData(currentTemp, 0.0);
-                }
-                return; // Retorna para performQuickReading -> Sleep
+            } else {
+                Serial.printf("🌡️ Monitoramento: %.1f°C\n", currentTemp);
             }
         }
-        
-        // 3. Respeitar intervalo configurado para reenvio
+
         if (now - lastSend >= resendIntervalMs) {
             lastSend = now;
-            
-            Serial.printf("🔄 Ciclo de reenvio (%lu min): Conectando WiFi...\n", resendIntervalMs / 60000);
-            connectWiFiQuick();
-            
-            if (WiFi.status() == WL_CONNECTED) {
-                // Sincronizar intervalo se possível (caso tenha mudado no servidor)
+            Serial.printf("🔄 Ciclo de reenvio (%lu min): Preparando envio...\n", resendIntervalMs / 60000);
+            if (WiFi.status() == WL_CONNECTED && isfinite(currentTemp)) {
                 syncReadingInterval();
-                
-                // Atualizar intervalo de reenvio localmente
-                unsigned long newInterval = readingIntervalSec * 1000;
-                if (newInterval >= 300000) { // Só atualiza se for >= 5 min
+                unsigned long newInterval = readingIntervalSec * 1000UL;
+                if (newInterval >= 300000) {
                     resendIntervalMs = newInterval;
                     Serial.printf("⏱️ Intervalo atualizado: %lu min\n", resendIntervalMs / 60000);
                 }
-
                 Serial.println("📤 Reenviando dados de alerta...");
-                if (isfinite(currentTemp)) {
-                    sendSensorData(currentTemp, 0.0);
-                }
-                
-                // Checar OTA também durante o alerta (opcional, mas bom para correções)
+                sendSensorData(currentTemp, 0.0);
                 if (shouldCheckForUpdate()) {
                     FirmwareInfo fw = checkFirmwareUpdate();
                     if (fw.available && canPerformUpdate(fw, getBatteryPercentage(readBatteryVoltage()), WiFi.RSSI())) {
                         performOTAUpdate(fw);
                     }
                 }
-                
-                Serial.println("📴 Desconectando WiFi novamente...");
-                WiFi.disconnect(true);
-                WiFi.mode(WIFI_OFF);
-                ledOff();
+            } else {
+                Serial.println("⚠️ WiFi indisponível para envio de alerta");
             }
         }
-        
-        // Pequeno delay para não travar CPU (watchdog) e permitir o piscar dos LEDs
-        delay(100); 
+
+        if (isfinite(currentTemp) && currentTemp > TEMP_YELLOW_ALERT_THRESHOLD) {
+            Serial.println("✅ TEMPERATURA NORMALIZADA! Encerrando alerta.");
+            digitalWrite(TEMP_ALERT_LED1, LOW);
+            digitalWrite(TEMP_ALERT_LED2, LOW);
+            digitalWrite(TEMP_ALERT_BUZZER, LOW);
+            if (WiFi.status() != WL_CONNECTED) {
+                connectWiFiQuick();
+            }
+            if (WiFi.status() == WL_CONNECTED) {
+                Serial.println("📤 Enviando leitura de normalização...");
+                sendSensorData(currentTemp, 0.0);
+            }
+            return;
+        }
+
+        delay(100);
         yield();
     }
 }
@@ -4572,35 +4494,9 @@ wifi_connected:
 
 void enterDeepSleep()
 {
-    Serial.println("😴 Entrando em Deep Sleep por " + String(readingIntervalSec / 60) + " minutos...");
-    Serial.println("⏰ Próximo acordar em: " + String(readingIntervalSec) + " segundos (" + String(readingIntervalSec / 60) + " min)");
-    Serial.println("🔋 Consumo: ~10µA durante o sono");
-    Serial.println("💡 LED: APAGADO durante sleep");
-    
-    // Salvar estatísticas antes de dormir
-    preferences.putULong("sleep_count", preferences.getULong("sleep_count", 0) + 1);
-    preferences.putULong("last_sleep", millis());
-    
-    // APAGAR LED antes de dormir
-    ledOff();
-    
-    // DESLIGAR ALERTAS DE TEMPERATURA antes de dormir (economia de energia)
-    digitalWrite(TEMP_ALERT_LED1, LOW);
-    digitalWrite(TEMP_ALERT_LED2, LOW);
-    digitalWrite(TEMP_ALERT_BUZZER, LOW);
-    Serial.println("🔇 Alertas de temperatura desligados");
-    
-    // Configurar timer para acordar com intervalo configurável
-    esp_sleep_enable_timer_wakeup(readingIntervalSec * 1000000ULL); // microsegundos
-    
-    // Também permitir acordar com botão (opcional)
-    esp_sleep_enable_ext0_wakeup(GPIO_NUM_0, 0); // GPIO 0 = botão BOOT
-    
-    Serial.println("💤 Dormindo agora... ZZZ");
-    Serial.flush(); // Garantir que mensagem seja enviada
-    
-    // Entrar em deep sleep
-    esp_deep_sleep_start();
+    Serial.println("⚠️ enterDeepSleep() chamado, mas o firmware está em modo CA contínuo 24h.");
+    Serial.println("⚡ Nenhuma ação de hibernação será executada para evitar desligamento.");
+    Serial.flush();
 }
 
 // ============================================================================
@@ -4850,34 +4746,26 @@ void handleWiFiDisconnection()
  * 📋 GUIA COMPLETO DE INSTALAÇÃO E CONFIGURAÇÃO - ThermoWatch ESP32 com WiFiManager
  * ═══════════════════════════════════════════════════════════════════════════════════
  *
- * � MODO BATERIA - DEEP SLEEP (NOVO RECURSO):
+ * 🔌 MODO CA CONTÍNUO 24H - USO EM REDE ELÉTRICA:
  *
- * O ThermoWatch agora possui modo de economia de energia otimizado para bateria:
+ * O ThermoWatch foi configurado para operação contínua conectada à rede elétrica:
  *
  * ⚡ FUNCIONAMENTO:
- * - ESP32 acorda a cada 4 horas automaticamente
- * - Faz a leitura de temperatura e umidade
- * - Conecta no WiFi rapidamente (30s timeout)
- * - Envia dados para o Supabase
- * - Volta para deep sleep por mais 4 horas
- * - Consumo durante sono: ~10µA (meses de bateria)
+ * - ESP32 permanece ligado 24h por dia
+ * - Faz leituras periódicas de temperatura em intervalos configuráveis
+ * - Conecta no WiFi sempre que necessário
+ * - Envia dados para o Supabase continuamente
+ * - Não depende de bateria ou hibernação
  *
- * 🔧 COMO ATIVAR MODO BATERIA:
- * - O modo bateria é AUTOMÁTICO se WiFi já está configurado
- * - Para configurar WiFi: segure botão BOOT durante boot
- * - Após configurar WiFi, ESP32 entra automaticamente em modo bateria
+ * 🔧 COMO USAR NO MODO CA:
+ * - O dispositivo liga e opera sem hibernar
+ * - Pressione o botão BOOT para entrar em modo de configuração
+ * - Em modo configuração, o firmware permanece ativo continuamente
  *
- * 📊 ESTATÍSTICAS DE BATERIA:
- * - Tempo acordado: ~60 segundos a cada 4 horas
- * - Consumo ativo: ~150mA por 60s = 0.0417mAh por ciclo
- * - Consumo sleep: ~0.01mA por 4h = 0.04mAh por ciclo  
- * - Total: ~0.08mAh por ciclo = ~1.9mAh por dia
- * - Bateria 3000mAh = ~4 anos de funcionamento
- *
- * 🔄 COMO SAIR DO MODO BATERIA:
- * - Segure o botão BOOT durante a inicialização
- * - ESP32 entrará em modo configuração contínua
- * - Use para reconfigurar WiFi ou testar sensor
+ * 💡 RECOMENDAÇÕES:
+ * - Use fonte estabilizada 5V/3A para alimentar o ESP32 e periféricos
+ * - Garanta bom ventilação se a caixa for fechada
+ * - O intervalo de leitura pode ser ajustado via WiFiManager
  *
  * 🔧 BIBLIOTECAS NECESSÁRIAS (instalar via Library Manager do Arduino IDE):
  *
