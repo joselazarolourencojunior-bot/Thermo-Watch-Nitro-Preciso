@@ -1,4 +1,4 @@
-/*
+﻿/*
  * ThermoWatch ESP32 - Código com WiFiManager para configuração via Portal Captivo
  * VERSÃO PT100 COM ADC (SOLUÇÃO IMPROVISADA - PRECISÃO LIMITADA)
  *
@@ -42,6 +42,7 @@
 #include <Update.h>
 #include <HTTPUpdate.h>
 #include <SPI.h>
+#include <vector>
 
 // Configurações de hardware
 #define LED_PIN 2
@@ -120,6 +121,10 @@ bool syncOffsetWithServer();
 bool syncDeviceLocationWithServer();
 bool reportOffsetToServer();
 void sendHeartbeat();
+String buildSensorReadingJson(float temperature, float humidity, const String &powerMode = "MAINS");
+bool sendSensorDataJson(const String &jsonString);
+void queueSensorEvent(const String &eventJson);
+bool flushPendingSensorEvents();
 String formatUptime(unsigned long ms);
 void blinkLED(int times, int delayMs);
 void setLED(bool state);
@@ -132,14 +137,13 @@ void initLedTimer();
 void startLedBlink();
 void stopLedBlink();
 void setStatusLedAllowed(bool allowed);
+void setLedBlinkInterval(unsigned long intervalMs);
 void IRAM_ATTR onLedTimer();
 String getISOTimestamp();
 float readBatteryVoltage();
 float getBatteryPercentage(float voltage);
 String getBatteryStatus(float voltage, float percentage);
-bool checkBatteryAlert(float voltage, float percentage);
-bool checkWiFiSignalAlert(int rssi);
-String getWiFiSignalQuality(int rssi);
+bool checkWiFiSignalQuality(int rssi);
 void displayBatteryInfo();
 bool sendSensorData(float temperature, float humidity);
 void showWakeupReason();
@@ -204,6 +208,7 @@ const bool useGeolocation = true; // ✅ Executa apenas 1x no primeiro boot, dep
 // Instâncias
 WiFiManager wm;
 Preferences preferences;
+bool timeSynced = false;
 
 // Variável global de offset (sincronizada com servidor)
 float tempOffset = TEMP_OFFSET;
@@ -476,6 +481,11 @@ hw_timer_t *ledTimer = NULL;
 volatile bool ledState = false;
 volatile bool ledBlinkEnabled = false;
 bool statusLedAllowed = false;
+unsigned long ledBlinkIntervalMs = 1000; // default 1 second blink interval
+
+// Fila de eventos de leituras pendentes quando não for possível enviar ao servidor
+std::vector<String> pendingSensorEvents;
+const int MAX_PENDING_EVENTS = 10;
 
 // Callback para salvar configurações
 void saveConfigCallback()
@@ -1440,9 +1450,17 @@ void connectWiFi()
 {
     Serial.println("📡 Conectando ao WiFi...");
     setStatusLedAllowed(true);
+    setLedBlinkInterval(500);
     startLedBlink();
 
     String apName = FIRMWARE_VERSION;
+
+    // Garantir que o WiFi anterior seja limpo antes de iniciar o portal
+    WiFi.disconnect(true);
+    delay(100);
+    WiFi.mode(WIFI_AP_STA);
+    WiFi.setAutoReconnect(true);
+    WiFi.persistent(true);
 
     // Tentar conectar
     if (!wm.autoConnect(apName.c_str(), "12345678"))
@@ -1466,9 +1484,21 @@ void connectWiFi()
 
     validateOTAUpdate();
 
+    if (shouldCheckForUpdate()) {
+         FirmwareInfo fwInfo = checkFirmwareUpdate();
+         if (fwInfo.available) {
+             float batPct = getBatteryPercentage(readBatteryVoltage());
+             if (canPerformUpdate(fwInfo, batPct, WiFi.RSSI())) {
+                 performOTAUpdate(fwInfo);
+             }
+         }
+    }
+
     // Sincronizar horário via NTP
     syncNTP();
 
+    setLedBlinkInterval(1000);
+    ledOperationMode();
     blinkLED(2, 500); // 2 piscadas lentas = WiFi conectado
 
     if (shouldRestartAfterConfig) {
@@ -1721,6 +1751,10 @@ void loop()
             Serial.printf("\n✅ WiFi RECONECTADO após %lu segundos!\n", reconnectTime / 1000);
             Serial.printf("📊 Tentativas necessárias: %d\n", wifiReconnectAttempts);
             resetWiFiReconnectCounters();
+            if (!pendingSensorEvents.empty()) {
+                Serial.println("📦 WiFi restaurado! Descarregando fila pendente imediatamente...");
+                flushPendingSensorEvents();
+            }
         }
         wifiWasEverConnected = true;
         digitalWrite(LED_PIN, LOW); // LED apagado = OK
@@ -1966,7 +2000,7 @@ void registerDevice()
     http.setTimeout(10000);
 
     // Criar JSON do dispositivo com mais informações
-    DynamicJsonDocument doc(1024);
+    DynamicJsonDocument doc(2048);
     doc["id"] = deviceId;
     doc["name"] = DEVICE_DB_NAME;
     doc["description"] = deviceDescription;
@@ -1979,6 +2013,20 @@ void registerDevice()
     doc["last_seen"] = getISOTimestamp();
     doc["signal_strength"] = WiFi.RSSI();
     doc["reading_interval"] = readingIntervalSec;
+    doc["status"] = "em_teste";
+    doc["is_enabled"] = true;
+    doc["power_mode"] = "MAINS";
+    doc["auto_update_enabled"] = true;
+    doc["battery_level"] = 100;
+    doc["battery_voltage"] = 0.0;
+    doc["battery_percentage"] = 100;
+    doc["battery_status"] = "MAINS";
+    doc["battery_low_alert"] = false;
+    doc["battery_critical_alert"] = false;
+    doc["last_battery_check"] = getISOTimestamp();
+    doc["parceiro_id"] = "";
+    doc["cliente_id"] = "";
+    doc["valor_total"] = 0;
 
     // Metadados adicionais
     JsonObject metadata = doc.createNestedObject("metadata");
@@ -2066,7 +2114,7 @@ void updateDeviceBatteryStatus(float batteryVoltage, float batteryPercentage, St
     http.addHeader("Content-Type", "application/json");
     http.setTimeout(10000);
 
-    DynamicJsonDocument doc(512);
+    DynamicJsonDocument doc(2048);
     doc["name"] = DEVICE_DB_NAME;
     doc["is_online"] = true;
     doc["last_seen"] = getISOTimestamp();
@@ -2078,6 +2126,14 @@ void updateDeviceBatteryStatus(float batteryVoltage, float batteryPercentage, St
     doc["last_battery_check"] = getISOTimestamp();
     doc["power_mode"] = "MAINS";
     doc["signal_strength"] = WiFi.RSSI();
+    doc["status"] = "em_teste";
+    doc["is_enabled"] = true;
+    doc["auto_update_enabled"] = true;
+    doc["reading_interval"] = readingIntervalSec;
+    doc["battery_level"] = (int)batteryPercentage;
+    doc["parceiro_id"] = "";
+    doc["cliente_id"] = "";
+    doc["valor_total"] = 0;
 
     String loc = deviceLocation;
     loc.trim();
@@ -2406,6 +2462,11 @@ void readAndSendSensorData()
         blinkLED(5, 200);
         return;
     }
+
+    if (temperature <= TEMP_YELLOW_ALERT_THRESHOLD) {
+        Serial.println("⚠️ Temperatura em zona de alerta detectada antes de conectar WiFi");
+        checkTemperatureAlerts(temperature);
+    }
     
     // ===== ALERTAS DE TEMPERATURA =====
     // Não ativa alertas em modo configuração - apenas em monitoramento contínuo
@@ -2436,15 +2497,8 @@ void readAndSendSensorData()
     if (WiFi.status() != WL_CONNECTED) {
         Serial.println("❌ WiFi DESCONECTADO!");
         Serial.println("   - Status: " + String(WiFi.status()));
-        
-        // LED ERRO WIFI: 3 piscadas MÉDIAS
-        Serial.println("🚨 LED: 3 piscadas MÉDIAS = ERRO WIFI");
-        for(int i = 0; i < 3; i++) {
-            digitalWrite(LED_PIN, HIGH);
-            delay(600);  // 600ms ligado
-            digitalWrite(LED_PIN, LOW);
-            delay(600);  // 600ms desligado
-        }
+        Serial.println("⚠️ Enfileirando evento para envio posterior");
+        queueSensorEvent(buildSensorReadingJson(temperature, humidity));
         return;
     }
     
@@ -2460,7 +2514,10 @@ void readAndSendSensorData()
     // 🔄 SINCRONIZAÇÃO E CONTROLE (NITRO)
     // ============================================================
     
-    // 1. Verificar se dispositivo está habilitado
+    // 1. Garantir que o dispositivo esteja cadastrado antes de sincronizar valores
+    ensureDeviceRegistered();
+
+    // 2. Verificar se dispositivo está habilitado
     if (!checkDeviceEnabled()) {
         Serial.println("⛔ Dispositivo DESABILITADO no servidor.");
         // Se estiver desabilitado, não envia dados e retorna
@@ -2468,14 +2525,19 @@ void readAndSendSensorData()
         return; 
     }
 
-    // 2. Sincronizar intervalo de leitura
+    // 3. Sincronizar intervalo de leitura
     syncReadingInterval();
 
-    // 3. Sincronizar offset de temperatura
+    // 4. Sincronizar offset de temperatura
     syncOffsetWithServer();
 
-    // 3.1 Sincronizar localização do device
+    // 5. Sincronizar localização do device
     syncDeviceLocationWithServer();
+
+    if (!pendingSensorEvents.empty()) {
+        Serial.println("📦 Eventos pendentes aguardando envio. Tentando agora...");
+        flushPendingSensorEvents();
+    }
 
     // 4. Verificar atualização de firmware (OTA)
     if (shouldCheckForUpdate()) {
@@ -2489,7 +2551,6 @@ void readAndSendSensorData()
     }
     // ============================================================
 
-    ensureDeviceRegistered();
     float batteryVoltageNow = readBatteryVoltage();
     float batteryPercentageNow = getBatteryPercentage(batteryVoltageNow);
     String batteryStatusNow = getBatteryStatus(batteryVoltageNow, batteryPercentageNow);
@@ -2780,8 +2841,18 @@ void initLedTimer() {
     ledTimer = timerBegin(0, 80, true);
     // Anexar interrupção
     timerAttachInterrupt(ledTimer, &onLedTimer, true);
-    // Configurar para 200ms (200000 microsegundos)
-    timerAlarmWrite(ledTimer, 200000, true);
+    timerAlarmWrite(ledTimer, ledBlinkIntervalMs * 500ULL, true);
+}
+
+void setLedBlinkInterval(unsigned long intervalMs)
+{
+    if (intervalMs == 0) {
+        return;
+    }
+    ledBlinkIntervalMs = intervalMs;
+    if (ledTimer != NULL) {
+        timerAlarmWrite(ledTimer, ledBlinkIntervalMs * 500ULL, true);
+    }
 }
 
 // Iniciar piscada do LED
@@ -2819,16 +2890,20 @@ void setLED(bool state)
     digitalWrite(LED_PIN, state ? HIGH : LOW);
 }
 
-// LED MODO CONFIGURAÇÃO: Aceso fixo
+// LED MODO CONFIGURAÇÃO: Piscando em 1s para indicar que o sistema está ligado
 void ledConfigMode()
 {
+    setLedBlinkInterval(1000);
+    setStatusLedAllowed(true);
     startLedBlink();
 }
 
-// LED MODO OPERAÇÃO: Iniciar piscada rápida em background
+// LED MODO OPERAÇÃO: Piscar a cada 1s em operação normal
 void ledOperationMode()
 {
-    ledOff();
+    setLedBlinkInterval(1000);
+    setStatusLedAllowed(true);
+    startLedBlink();
 }
 
 // LED SUCESSO: Acende 2 segundos e apaga
@@ -2866,28 +2941,20 @@ void ledOff()
 
 String getISOTimestamp()
 {
-    // Usa horário real do NTP (sincronizado automaticamente)
-    time_t now;
-    struct tm timeinfo;
-
-    if (!getLocalTime(&timeinfo))
-    {
-        // Se NTP não está disponível, usar tempo baseado em millis()
-        unsigned long currentTime = millis();
-        unsigned long seconds = currentTime / 1000;
-        unsigned long minutes = seconds / 60;
-        unsigned long hours = minutes / 60;
-
-        // Formato ISO 8601 simulado (começando em 2025-01-01)
-        return "2025-01-01T" +
-               String((hours % 24), DEC) + ":" +
-               String((minutes % 60), DEC) + ":" +
-               String((seconds % 60), DEC) + ".000Z";
+    // Usa horário local sincronizado via NTP e formata em UTC para o servidor
+    time_t now = time(nullptr);
+    if (!timeSynced || now < 100000) {
+        Serial.println("⚠️ Timestamp inválido: NTP não sincronizado ou horário incorreto");
+        return String();
     }
 
-    // Se NTP está disponível, usar tempo real
+    struct tm timeinfo;
+    // Usar tempo em UTC para evitar descompasso de timezone no servidor
+    gmtime_r(&now, &timeinfo);
+
     char timestamp[32];
-    strftime(timestamp, sizeof(timestamp), "%Y-%m-%dT%H:%M:%S.000Z", &timeinfo);
+    // Formatar como ISO8601 em UTC com sufixo Z
+    strftime(timestamp, sizeof(timestamp), "%Y-%m-%dT%H:%M:%SZ", &timeinfo);
     return String(timestamp);
 }
 
@@ -2903,7 +2970,6 @@ void syncNTP()
     // Servidores NTP brasileiros
     configTime(-3 * 3600, 0, "a.st1.ntp.br", "b.st1.ntp.br", "pool.ntp.org");
     
-    // Aguardar até 5 segundos para sincronizar
     int attempts = 0;
     struct tm timeinfo;
     
@@ -2915,14 +2981,25 @@ void syncNTP()
     
     if (getLocalTime(&timeinfo))
     {
-        char buffer[64];
-        strftime(buffer, sizeof(buffer), "%d/%m/%Y %H:%M:%S", &timeinfo);
-        Serial.println("✅ Horário sincronizado: " + String(buffer));
-        Serial.println("🕐 RELÓGIO ATUAL: " + String(buffer) + " (Horário de Brasília - UTC-3)");
+        timeSynced = true;
+        time_t now = time(nullptr);
+        struct tm utcTime;
+        gmtime_r(&now, &utcTime);
+
+        char localBuffer[64];
+        strftime(localBuffer, sizeof(localBuffer), "%d/%m/%Y %H:%M:%S", &timeinfo);
+
+        char utcBuffer[64];
+        strftime(utcBuffer, sizeof(utcBuffer), "%Y-%m-%dT%H:%M:%SZ", &utcTime);
+
+        Serial.println("✅ Horário sincronizado: " + String(localBuffer));
+        Serial.println("   - Local (UTC-3): " + String(localBuffer));
+        Serial.println("   - UTC enviado: " + String(utcBuffer));
     }
     else
     {
-        Serial.println("⚠️ Falha ao sincronizar NTP - usando horário aproximado");
+        timeSynced = false;
+        Serial.println("⚠️ Falha ao sincronizar NTP - não será enviado timestamp confiável");
     }
 }
 
@@ -3079,135 +3156,6 @@ bool checkWiFiSignalAlert(int rssi)
     }
 }
 
-// ============================================================================
-// 🔋 FUNÇÕES DE ALERTA DE BATERIA
-// ============================================================================
-
-bool checkBatteryAlert(float voltage, float percentage)
-{
-    if (MAINS_POWER_MODE) {
-        Serial.println("ℹ️ Modo CA 24h - alertas de bateria desabilitados");
-        return true;
-    }
-    // Detectar se está alimentado por USB (sem bateria conectada)
-    // ADC raw < 50 (< 0.04V) indica que não há bateria
-    int rawTest = analogRead(BATTERY_PIN);
-    bool isUSBPowered = (rawTest < 50);
-    
-    if (isUSBPowered) {
-        Serial.println("ℹ️ Alimentação USB detectada - Alertas de bateria DESABILITADOS");
-        Serial.printf("   ADC Raw: %d (< 50 = sem bateria)\n", rawTest);
-        return true; // Não envia alerta se está em USB
-    }
-    
-    bool isCritical = (voltage <= BATTERY_CRITICAL_VOLTAGE);
-    bool isLow = (voltage <= BATTERY_LOW_VOLTAGE);
-    
-    if (isCritical) 
-    {
-        Serial.println("🚨 ALERTA CRÍTICO: Bateria em nível crítico!");
-        Serial.println("   Tensão: " + String(voltage, 2) + "V (" + String(percentage, 1) + "%)");
-        Serial.println("   RECARREGUE IMEDIATAMENTE para evitar danos!");
-        
-        // LED de alerta crítico (10 piscadas rápidas)
-        for (int i = 0; i < 10; i++) {
-            digitalWrite(LED_PIN, HIGH);
-            delay(100);
-            digitalWrite(LED_PIN, LOW);
-            delay(100);
-        }
-    }
-    else if (isLow) 
-    {
-        Serial.println("⚠️ ALERTA: Bateria baixa!");
-        Serial.println("   Tensão: " + String(voltage, 2) + "V (" + String(percentage, 1) + "%)");
-        Serial.println("   Considere recarregar em breve");
-        
-        // LED de alerta baixo (5 piscadas)
-        for (int i = 0; i < 5; i++) {
-            digitalWrite(LED_PIN, HIGH);
-            delay(200);
-            digitalWrite(LED_PIN, LOW);
-            delay(200);
-        }
-    }
-    
-    // Se é crítico ou baixo, enviar alerta ao banco de dados
-    if (isCritical || isLow) {
-        Serial.println("💾 Enviando alerta de bateria ao banco de dados...");
-        
-        String alertType = isCritical ? "battery_critical" : "battery_low";
-        
-        // PASSO 1: Primeiro, resolver (fechar) alertas anteriores do mesmo tipo
-        Serial.println("🔍 Verificando alertas anteriores não resolvidos...");
-        HTTPClient httpResolve;
-        String resolveUrl = String(supabaseUrl) + "/rest/v1/alerts?device_id=eq." + deviceId + "&alert_type=eq." + alertType + "&is_resolved=eq.false";
-        httpResolve.begin(resolveUrl);
-        httpResolve.addHeader("Content-Type", "application/json");
-        httpResolve.addHeader("apikey", supabaseKey);
-        httpResolve.addHeader("Authorization", "Bearer " + String(supabaseKey));
-        httpResolve.addHeader("Prefer", "return=minimal");
-        httpResolve.setTimeout(10000);
-        
-        String resolvePayload = "{\"is_resolved\":true}";
-        int resolveCode = httpResolve.PATCH(resolvePayload);
-        httpResolve.end();
-        
-        if (resolveCode == 200 || resolveCode == 204) {
-            Serial.println("✅ Alertas anteriores resolvidos");
-        } else {
-            Serial.printf("ℹ️ Nenhum alerta anterior encontrado ou já resolvido (código %d)\n", resolveCode);
-        }
-        
-        // PASSO 2: Agora criar novo alerta
-        HTTPClient http;
-        http.begin(String(supabaseUrl) + "/rest/v1/alerts");
-        http.addHeader("Content-Type", "application/json");
-        http.addHeader("apikey", supabaseKey);
-        http.addHeader("Authorization", "Bearer " + String(supabaseKey));
-        http.addHeader("Prefer", "return=representation");
-        http.setTimeout(10000);
-        
-        // Criar JSON do alerta conforme estrutura da tabela alerts
-        DynamicJsonDocument doc(512);
-        doc["device_id"] = deviceId;
-        doc["alert_type"] = alertType;
-        
-        // Mensagem incluindo tensão e porcentagem da bateria
-        String alertMessage = isCritical 
-            ? "🚨 Bateria CRÍTICA: " + String(voltage, 2) + "V (" + String(percentage, 0) + "%) - Recarregue imediatamente!"
-            : "⚠️ Bateria BAIXA: " + String(voltage, 2) + "V (" + String(percentage, 0) + "%) - Considere recarregar";
-        doc["message"] = alertMessage;
-        
-        doc["severity"] = isCritical ? "critical" : "warning";
-        doc["value"] = voltage;
-        doc["threshold"] = isCritical ? BATTERY_CRITICAL_VOLTAGE : BATTERY_LOW_VOLTAGE;
-        doc["is_resolved"] = false;
-        
-        String jsonString;
-        serializeJson(doc, jsonString);
-        
-        Serial.println("📤 JSON enviado: " + jsonString);
-        int httpCode = http.POST(jsonString);
-        
-        if (httpCode > 0) {
-            String response = http.getString();
-            Serial.printf("📥 Resposta HTTP %d: %s\n", httpCode, response.c_str());
-        }
-        http.end();
-        
-        if (httpCode == 200 || httpCode == 201) {
-            Serial.println("✅ Alerta de bateria enviado com sucesso!");
-            return true;
-        } else {
-            Serial.printf("❌ Erro ao enviar alerta de bateria: %d\n", httpCode);
-            return false;
-        }
-    }
-    
-    // Bateria normal, sem alerta
-    return true;
-}
 
 void displayBatteryInfo()
 {
@@ -3232,80 +3180,179 @@ void displayBatteryInfo()
     }
     
     // Não verificar alertas aqui pois WiFi não está conectado ainda
-    // checkBatteryAlert será chamado em performQuickReading() após conectar WiFi
+    // checkBatteryAlert será chamado em performQuickReading() antes de conectar
 }
 
 bool sendSensorData(float temperature, float humidity)
 {
-    HTTPClient http;
-    WiFiClientSecure client;
-    if (!beginSupabaseRequest(http, client, String(supabaseUrl) + "/rest/v1/sensor_readings")) {
-        http.end();
+    String jsonString = buildSensorReadingJson(temperature, humidity, "MAINS");
+    if (jsonString.length() == 0) {
+        Serial.println("❌ Evento não enviado: timestamp não disponível");
         return false;
     }
-    http.addHeader("Content-Type", "application/json");
-    http.setTimeout(15000); // 15 segundos - evita timeout com WiFi fraco (RSSI < -90dBm)
 
-    // Criar JSON da leitura com dados da bateria
-    DynamicJsonDocument doc(1024);
+    bool success = sendSensorDataJson(jsonString);
+
+    if (!success) {
+        queueSensorEvent(jsonString);
+        if (!pendingSensorEvents.empty()) {
+            setStatusLedAllowed(true);
+            setLedBlinkInterval(250);
+            startLedBlink();
+        }
+    } else {
+        if (pendingSensorEvents.empty()) {
+            setLedBlinkInterval(1000);
+        }
+    }
+
+    return success;
+}
+
+String buildSensorReadingJson(float temperature, float humidity, const String &powerMode)
+{
+    String timestamp = getISOTimestamp();
+    if (timestamp.length() == 0) {
+        Serial.println("⚠️ buildSensorReadingJson: timestamp inexistente, constru��o do payload abortada");
+        return String();
+    }
+
+    float batteryVoltage = readBatteryVoltage();
+    float batteryPercentage = getBatteryPercentage(batteryVoltage);
+    String batteryStatus = getBatteryStatus(batteryVoltage, batteryPercentage);
+
+    DynamicJsonDocument doc(2048);
     doc["device_id"] = deviceId;
     doc["device_name"] = deviceName;
     doc["temperature"] = temperature;
     doc["humidity"] = humidity;
-    doc["timestamp"] = getISOTimestamp();
+    doc["timestamp"] = timestamp;
     doc["sensor_type"] = "PT100";
 
-    // Dados de energia em modo CA 24h
-    doc["battery_voltage"] = 0.0;
-    doc["battery_percentage"] = 0;
-    doc["battery_status"] = "MAINS";
-
-    // Dados técnicos incluindo qualidade WiFi
     JsonObject rawData = doc.createNestedObject("raw_data");
-    int rssi = WiFi.RSSI();
+    int rssi = WiFi.status() == WL_CONNECTED ? WiFi.RSSI() : 0;
     rawData["wifi_rssi"] = rssi;
-    rawData["wifi_quality"] = getWiFiSignalQuality(rssi);  // EXCELENTE, BOM, FRACO, etc.
+    rawData["wifi_quality"] = getWiFiSignalQuality(rssi);
     rawData["free_heap"] = ESP.getFreeHeap();
     rawData["uptime_ms"] = millis();
-    rawData["reading_interval"] = readingIntervalSec; // Intervalo configurável via WiFiManager
-    
-    // ID único de transação para evitar duplicatas em caso de retry
-    // Formato: deviceId_cycleCount_uptimeMs (único por ciclo de acordar)
+    rawData["reading_interval"] = readingIntervalSec;
+    rawData["battery_voltage"] = batteryVoltage;
+    rawData["battery_percentage"] = (int)batteryPercentage;
+    rawData["battery_status"] = batteryStatus;
+    rawData["battery_low_alert"] = false;
+    rawData["battery_critical_alert"] = false;
+    rawData["wifi_weak_alert"] = (rssi <= WIFI_RSSI_WEAK);
+    rawData["power_mode"] = powerMode;
+    rawData["device_timestamp"] = timestamp;
+
     unsigned long sleepCount = preferences.getULong("sleep_count", 0);
     String transactionId = deviceId + "_" + String(sleepCount) + "_" + String(millis());
     rawData["transaction_id"] = transactionId;
-    
-    rawData["battery_low_alert"] = false;
-    rawData["battery_critical_alert"] = false;
-    rawData["wifi_weak_alert"] = (rssi <= WIFI_RSSI_WEAK);  // Alerta se sinal fraco
-    rawData["power_mode"] = "MAINS"; // Indicar que está em modo CA 24h
+
+    Serial.println("⏱️ Timestamp UTC usado no payload: " + timestamp);
 
     String jsonString;
     serializeJson(doc, jsonString);
+    return jsonString;
+}
+
+bool sendSensorDataJson(const String &jsonString)
+{
+    if (WiFi.status() != WL_CONNECTED) {
+        Serial.println("⚠️ WiFi desconectado - evento será armazenado na fila pendente");
+        return false;
+    }
+
+    setStatusLedAllowed(true);
+    setLedBlinkInterval(500);
+    startLedBlink();
+
+    HTTPClient http;
+    WiFiClientSecure client;
+    if (!beginSupabaseRequest(http, client, String(supabaseUrl) + "/rest/v1/sensor_readings")) {
+        http.end();
+        Serial.println("❌ Falha ao iniciar requisição HTTPS para Supabase");
+        return false;
+    }
+    http.addHeader("Content-Type", "application/json");
+    http.addHeader("Prefer", "return=minimal");
+    http.setTimeout(15000);
 
     int httpResponseCode = http.POST(jsonString);
-    bool success = (httpResponseCode == 201);
+    bool success = (httpResponseCode == 200 || httpResponseCode == 201 || httpResponseCode == 204);
 
     if (success) {
-        Serial.printf("✅ Dados enviados: %.1f°C | Modo: MAINS\n", temperature);
-        Serial.printf("   Transaction ID: %s\n", transactionId.c_str());
+        Serial.println("✅ Evento enviado para Supabase");
     } else {
-        // Log detalhado para diagnóstico de problemas
-        Serial.printf("❌ Erro HTTP: %d ", httpResponseCode);
+        Serial.printf("❌ Erro HTTP ao enviar evento: %d\n", httpResponseCode);
         if (httpResponseCode == -1) {
-            Serial.println("(Timeout - conexão lenta ou WiFi instável)");
+            Serial.println("   (Timeout - conexão lenta ou WiFi instável)");
         } else if (httpResponseCode == -11) {
-            Serial.println("(Timeout de leitura)");
+            Serial.println("   (Timeout de leitura)");
         } else if (httpResponseCode < 0) {
-            Serial.printf("(Erro de conexão: %d)\n", httpResponseCode);
+            Serial.printf("   (Erro de conexão: %d)\n", httpResponseCode);
         } else {
-            Serial.println("(Erro do servidor)");
+            Serial.println("   (Erro do servidor)");
         }
-        Serial.printf("   RSSI: %d dBm | Heap: %d bytes\n", WiFi.RSSI(), ESP.getFreeHeap());
     }
 
     http.end();
     return success;
+}
+
+void queueSensorEvent(const String &eventJson)
+{
+    if (pendingSensorEvents.size() >= MAX_PENDING_EVENTS) {
+        Serial.println("⚠️ Fila de eventos pendentes cheia - descartando evento mais antigo");
+        pendingSensorEvents.erase(pendingSensorEvents.begin());
+    }
+    pendingSensorEvents.push_back(eventJson);
+    Serial.printf("📦 Evento pendente enfileirado (%d/%d)\n", pendingSensorEvents.size(), MAX_PENDING_EVENTS);
+
+    setStatusLedAllowed(true);
+    setLedBlinkInterval(100);
+    startLedBlink();
+}
+
+bool flushPendingSensorEvents()
+{
+    if (pendingSensorEvents.empty()) {
+        return true;
+    }
+
+    if (WiFi.status() != WL_CONNECTED) {
+        Serial.println("⚠️ Não é possível enviar eventos pendentes: WiFi desconectado");
+        return false;
+    }
+
+    Serial.printf("📦 Enviando %d eventos pendentes...\n", pendingSensorEvents.size());
+    size_t sentCount = 0;
+
+    while (!pendingSensorEvents.empty()) {
+        String eventJson = pendingSensorEvents.front();
+        if (!sendSensorDataJson(eventJson)) {
+            Serial.printf("⚠️ Falha ao enviar evento pendente #%d\n", sentCount + 1);
+            break;
+        }
+        pendingSensorEvents.erase(pendingSensorEvents.begin());
+        sentCount++;
+    }
+
+    if (sentCount > 0) {
+        Serial.printf("✅ %d eventos pendentes enviados\n", sentCount);
+    }
+
+    if (pendingSensorEvents.empty()) {
+        Serial.println("✅ Todos eventos pendentes foram enviados");
+        setLedBlinkInterval(1000);
+    } else {
+        Serial.printf("⚠️ Ainda restam %d eventos pendentes\n", pendingSensorEvents.size());
+        setStatusLedAllowed(true);
+        setLedBlinkInterval(100);
+        startLedBlink();
+    }
+
+    return pendingSensorEvents.empty();
 }
 
 // ============================================================================
@@ -3851,6 +3898,11 @@ float performQuickReading()
             Serial.println("❄️ MODO CRIOGÊNICO ativado (T < -200°C)");
         }
     }
+
+    if (temperature <= TEMP_YELLOW_ALERT_THRESHOLD) {
+        Serial.println("⚠️ Temperatura em zona de alerta detectada antes de conectar WiFi");
+        checkTemperatureAlerts(temperature);
+    }
     
     // Em modo CA 24h, não há alertas de bateria nem hibernação por carga baixa.
     
@@ -3859,6 +3911,9 @@ float performQuickReading()
     if (temperature <= TEMP_RED_ALERT_THRESHOLD) {
         Serial.println("\n🚨 ALERTA DE TEMPERATURA CRÍTICA DETECTADO!");
         Serial.println("🚨 Iniciando ciclo de envio contínuo e alerta sonoro/visual...");
+        
+        // Mostrar alerta imediatamente, antes de tentar conectar WiFi
+        checkTemperatureAlerts(temperature);
         
         // 1. Conectar WiFi (se não estiver conectado)
         if (WiFi.status() != WL_CONNECTED) {
@@ -3871,20 +3926,13 @@ float performQuickReading()
             ensureDeviceRegistered();
             syncOffsetWithServer();
             syncDeviceLocationWithServer();
+            flushPendingSensorEvents();
             bool sent = sendSensorData(temperature, humidity);
-            checkBatteryAlert(batteryVoltage, batteryPercentage);
             if (sent) {
                 updateDeviceBatteryStatus(batteryVoltage, batteryPercentage, batteryStatus);
             }
 
-            Serial.println("🔄 OTA: Checando atualização durante alerta...");
-            FirmwareInfo fwInfo = checkFirmwareUpdate();
-            if (fwInfo.available) {
-                float batPct = getBatteryPercentage(readBatteryVoltage());
-                if (canPerformUpdate(fwInfo, batPct, WiFi.RSSI())) {
-                    performOTAUpdate(fwInfo);
-                }
-            }
+            Serial.println("ℹ️ OTA: atualização adiada para fora do caminho de alerta contínuo");
         }
         
         // 3. Entrar em loop de monitoramento contínuo
@@ -4056,21 +4104,6 @@ float performQuickReading()
     yield();
     delay(500);
     
-    // [4A/5] SE BATERIA CRÍTICA: Enviar alerta (NÃO BLOQUEANTE)
-    if (isCriticalBattery) {
-        Serial.println("\n[4A/5] ⚠️ ENVIANDO ALERTA DE BATERIA CRÍTICA (tentativa única, não bloqueante)...");
-        
-        // Tenta enviar alerta mas NÃO bloqueia se falhar
-        if (checkBatteryAlert(batteryVoltage, batteryPercentage)) {
-            Serial.println("✅ Alerta de bateria enviado");
-        } else {
-            Serial.println("⚠️ Alerta de bateria falhou (será reenviado no próximo ciclo)");
-        }
-        
-        yield(); // Feed watchdog
-        delay(500);
-    }
-    
     // ===== HEARTBEAT DESABILITADO PARA ECONOMIA DE BATERIA =====
     // O heartbeat era redundante pois os dados de bateria já são enviados junto com
     // as leituras do sensor em sendSensorData(). Economiza ~2-3 segundos de WiFi ativo
@@ -4114,6 +4147,11 @@ float performQuickReading()
     yield();
     delay(500);
     */
+    
+    if (!pendingSensorEvents.empty()) {
+        Serial.println("\n📦 Ainda existem eventos pendentes. Tentando enviar primeiro...");
+        flushPendingSensorEvents();
+    }
     
     // [5C/6] ENVIAR DADOS DO SENSOR (JÁ LIDOS NO INÍCIO)
     Serial.println("\n[5/5] 📤 Enviando dados do sensor (lidos antes de conectar WiFi)...");
@@ -4178,10 +4216,6 @@ float performQuickReading()
         
         if (sendSensorData(temperature, humidity)) {
             Serial.println("✅ Dados enviados com sucesso");
-            
-            // ===== ENVIAR ALERTA DE BATERIA SE NECESSÁRIO =====
-            // Envia alerta se bateria estiver baixa ou crítica (e ainda não enviado)
-            checkBatteryAlert(batteryVoltage, batteryPercentage);
             
             // ===== ATUALIZAR STATUS DE BATERIA NA TABELA DEVICES =====
             // Isso garante que as tabelas devices fiquem sincronizadas com sensor_readings
@@ -4274,10 +4308,10 @@ void monitorTemperatureUntilSafe(float initialTemp) {
     
     // Configurações do ciclo de alerta
     const unsigned long RECHECK_INTERVAL = 30000; // 30 segundos entre leituras do sensor
-    unsigned long resendIntervalMs = readingIntervalSec * 1000UL;
-    if (resendIntervalMs < 300000) resendIntervalMs = 300000; // Mínimo 5 minutos em alerta
+    const unsigned long ALERT_SEND_INTERVAL = 30000; // 30 segundos entre envios enquanto estiver em alerta
+    unsigned long resendIntervalMs = ALERT_SEND_INTERVAL;
     
-    Serial.printf("⏱️ Intervalo de reenvio configurado para: %lu minutos\n", resendIntervalMs / 60000);
+    Serial.printf("⏱️ Intervalo de reenvio configurado para: %lu segundos\n", resendIntervalMs / 1000);
     
     unsigned long lastCheck = 0;
     unsigned long lastSend = millis(); // já enviou o inicial antes de entrar aqui
@@ -4307,22 +4341,10 @@ void monitorTemperatureUntilSafe(float initialTemp) {
 
         if (now - lastSend >= resendIntervalMs) {
             lastSend = now;
-            Serial.printf("🔄 Ciclo de reenvio (%lu min): Preparando envio...\n", resendIntervalMs / 60000);
+            Serial.printf("🔄 Ciclo de reenvio (%lu seg): Preparando envio...\n", resendIntervalMs / 1000);
             if (WiFi.status() == WL_CONNECTED && isfinite(currentTemp)) {
-                syncReadingInterval();
-                unsigned long newInterval = readingIntervalSec * 1000UL;
-                if (newInterval >= 300000) {
-                    resendIntervalMs = newInterval;
-                    Serial.printf("⏱️ Intervalo atualizado: %lu min\n", resendIntervalMs / 60000);
-                }
                 Serial.println("📤 Reenviando dados de alerta...");
                 sendSensorData(currentTemp, 0.0);
-                if (shouldCheckForUpdate()) {
-                    FirmwareInfo fw = checkFirmwareUpdate();
-                    if (fw.available && canPerformUpdate(fw, getBatteryPercentage(readBatteryVoltage()), WiFi.RSSI())) {
-                        performOTAUpdate(fw);
-                    }
-                }
             } else {
                 Serial.println("⚠️ WiFi indisponível para envio de alerta");
             }
@@ -4367,6 +4389,7 @@ bool connectWiFiQuick()
     WiFi.setAutoReconnect(true);
     WiFi.persistent(true);
     setStatusLedAllowed(true);
+    setLedBlinkInterval(500);
     startLedBlink();
     
     // Primeiro: tentar scan para verificar se a rede está disponível
@@ -4924,3 +4947,4 @@ void handleWiFiDisconnection()
  * 🌡️ ThermoWatch ESP32 v2.0 - Sistema de Monitoramento Inteligente com WiFiManager
  * ═══════════════════════════════════════════════════════════════════════════════════
  */
+
