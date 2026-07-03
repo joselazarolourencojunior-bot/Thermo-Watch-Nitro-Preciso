@@ -67,15 +67,15 @@
 // 2, 3 ou 4 (defina conforme sua ligação do PT100)
 #define MAX31865_WIRES 2
 
-// Sistema de alertas de temperatura - 3 ZONAS APENAS
-// ZONA 1: T > 195.5°C = NORMAL (sem alertas)
-// ZONA 2: 193.5°C < T ≤ 195.5°C = ALERTA AMARELO (LED1 pisca, sem buzzer)
-// ZONA 3: T ≤ 193.5°C = ALERTA VERMELHO (LED2+Buzzer piscam)
+// Sistema de alertas de temperatura - 3 ZONAS APENAS (criogênico)
+// ZONA 1: T <= -195.5°C = NORMAL (sem alertas)
+// ZONA 2: -195.5°C < T <= -193.5°C = ALERTA AMARELO (LED1 pisca, sem buzzer)
+// ZONA 3: T > -193.5°C = ALERTA VERMELHO (LED2+Buzzer piscam)
 #define TEMP_ALERT_LED1 15   // GPIO15 - LED amarelo de alerta
 #define TEMP_ALERT_LED2 16   // GPIO16 - LED vermelho de alerta crítico
 #define TEMP_ALERT_BUZZER 12 // GPIO12 - Buzzer no alerta crítico
-#define TEMP_YELLOW_ALERT_THRESHOLD 195.5 // Início alerta amarelo (°C)
-#define TEMP_RED_ALERT_THRESHOLD 193.5    // Início alerta vermelho/crítico (°C)
+#define TEMP_YELLOW_ALERT_THRESHOLD -195.5 // Início alerta amarelo (°C)
+#define TEMP_RED_ALERT_THRESHOLD -193.5    // Início alerta vermelho/crítico (°C)
 #define TEMP_ALERT_INTERVAL 500           // Intervalo piscada (ms)
 #define MAINS_POWER_MODE true               // Dispositivo ligado na rede elétrica 24h
 
@@ -162,6 +162,7 @@ bool sendFinalBatteryNotification(float temperature, float humidity, float batte
 bool getWiFiGeolocation();
 bool syncDeviceGeolocation();
 bool shouldUpdateGeolocation();
+bool confirmTemperatureAboveThreshold(float firstTemp, float threshold, uint8_t samples = 3, uint8_t requiredHits = 2, unsigned long sampleDelayMs = 120);
 // OTA Update functions
 bool shouldCheckForUpdate();
 FirmwareInfo checkFirmwareUpdate();
@@ -384,6 +385,30 @@ float readPT100Temperature()
                   rtd, resistance, temperature, fault);
 
     return temperature;
+}
+
+bool confirmTemperatureAboveThreshold(float firstTemp, float threshold, uint8_t samples, uint8_t requiredHits, unsigned long sampleDelayMs)
+{
+    if (!isfinite(firstTemp) || samples == 0 || requiredHits == 0) {
+        return false;
+    }
+
+    uint8_t hits = (firstTemp > threshold) ? 1 : 0;
+
+    for (uint8_t i = 1; i < samples; i++) {
+        delay(sampleDelayMs);
+        yield();
+
+        float sampleTemp = readPT100Temperature();
+        if (isfinite(sampleTemp) && sampleTemp > threshold) {
+            hits++;
+        }
+    }
+
+    Serial.printf("🔎 Confirmação de alerta (limite %.1f°C): %u/%u leituras acima\n",
+                  threshold, hits, samples);
+
+    return hits >= requiredHits;
 }
 
 // Variáveis configuráveis (salvas na EEPROM)
@@ -1056,9 +1081,9 @@ void validateOTAUpdate() {
 
 /**
  * Verifica temperatura e ativa alertas visuais/sonoros
- * - T > 195.5°C: NORMAL (sem alertas)
- * - 193.5°C < T ≤ 195.5°C: ALERTA AMARELO (LED1 pisca, sem buzzer)
- * - T ≤ 193.5°C: ALERTA VERMELHO (LED2 + Buzzer piscam)
+ * - T <= -195.5°C: NORMAL (sem alertas)
+ * - -195.5°C < T <= -193.5°C: ALERTA AMARELO (LED1 pisca, sem buzzer)
+ * - T > -193.5°C: ALERTA VERMELHO (LED2 + Buzzer piscam)
  * NUNCA os dois LEDs piscam juntos - lógica excludente
  */
 void checkTemperatureAlerts(float temperature) {
@@ -1066,8 +1091,8 @@ void checkTemperatureAlerts(float temperature) {
     static bool alertState = false;
     unsigned long currentMillis = millis();
     
-    // ZONA 1: Temperatura NORMAL (> 195.5°C) - desliga alertas
-    if (temperature > TEMP_YELLOW_ALERT_THRESHOLD) {
+    // ZONA 1: Temperatura NORMAL (<= -195.5°C) - desliga alertas
+    if (temperature <= TEMP_YELLOW_ALERT_THRESHOLD) {
         digitalWrite(TEMP_ALERT_LED1, LOW);
         digitalWrite(TEMP_ALERT_LED2, LOW);
         digitalWrite(TEMP_ALERT_BUZZER, LOW);
@@ -1079,25 +1104,25 @@ void checkTemperatureAlerts(float temperature) {
         lastToggle = currentMillis;
         alertState = !alertState;
         
-        // ZONA 2: ALERTA AMARELO (193.5°C < T ≤ 195.5°C) - APENAS LED1 pisca
-        if (temperature > TEMP_RED_ALERT_THRESHOLD) {
+        // ZONA 2: ALERTA AMARELO (-195.5°C < T <= -193.5°C) - APENAS LED1 pisca
+        if (temperature <= TEMP_RED_ALERT_THRESHOLD) {
             digitalWrite(TEMP_ALERT_LED2, LOW);  // LED2 sempre desligado
             digitalWrite(TEMP_ALERT_BUZZER, LOW);  // Buzzer sempre desligado
             digitalWrite(TEMP_ALERT_LED1, alertState ? HIGH : LOW);
             
             if (alertState) {
                 Serial.printf("⚠️ ALERTA AMARELO: %.1f°C (%.1f a %.1f°C) - LED1 ATIVO\n", 
-                             temperature, TEMP_RED_ALERT_THRESHOLD, TEMP_YELLOW_ALERT_THRESHOLD);
+                             temperature, TEMP_YELLOW_ALERT_THRESHOLD, TEMP_RED_ALERT_THRESHOLD);
             }
         }
-        // ZONA 3: ALERTA VERMELHO (T ≤ 193.5°C) - LED2 + Buzzer piscam juntos
+        // ZONA 3: ALERTA VERMELHO (T > -193.5°C) - LED2 + Buzzer piscam juntos
         else {
             digitalWrite(TEMP_ALERT_LED2, alertState ? HIGH : LOW);
             digitalWrite(TEMP_ALERT_BUZZER, alertState ? HIGH : LOW);
             digitalWrite(TEMP_ALERT_LED1, LOW);  // LED1 sempre desligado
             
             if (alertState) {
-                Serial.printf("🚨 ALERTA VERMELHO: %.1f°C (≤ %.1f°C) - LED2+BUZZER ATIVOS\n", 
+                Serial.printf("🚨 ALERTA VERMELHO: %.1f°C (> %.1f°C) - LED2+BUZZER ATIVOS\n", 
                              temperature, TEMP_RED_ALERT_THRESHOLD);
             }
         }
@@ -1151,9 +1176,9 @@ void setup()
     digitalWrite(TEMP_ALERT_LED2, LOW);
     digitalWrite(TEMP_ALERT_BUZZER, LOW);
     Serial.println("🚨 Sistema de alarme de temperatura configurado:");
-    Serial.printf("   LED1 (GPIO%d): Amarelo %.1f°C > T > %.1f°C (sem buzzer)\n", 
+    Serial.printf("   LED1 (GPIO%d): Amarelo %.1f°C < T <= %.1f°C (sem buzzer)\n", 
                   TEMP_ALERT_LED1, TEMP_YELLOW_ALERT_THRESHOLD, TEMP_RED_ALERT_THRESHOLD);
-    Serial.printf("   LED2 (GPIO%d) + Buzzer (GPIO%d): Vermelho T ≤ %.1f°C\n", 
+    Serial.printf("   LED2 (GPIO%d) + Buzzer (GPIO%d): Vermelho T > %.1f°C\n", 
                   TEMP_ALERT_LED2, TEMP_ALERT_BUZZER, TEMP_RED_ALERT_THRESHOLD);
     
     // Em modo CA 24h, não é necessário monitorar bateria
@@ -1216,18 +1241,18 @@ void setup()
         float currentTemp = performQuickReading();
         
         // VERIFICAR SE TEMPERATURA ESTÁ EM ZONA DE ALERTA
-        // Zona alerta AMARELA: 193.5°C < T ≤ 195.5°C (LED1)
-        // Zona alerta VERMELHA: T ≤ 193.5°C (LED2+Buzzer)
-        bool isInAlertZone = (currentTemp <= TEMP_YELLOW_ALERT_THRESHOLD);
+        // Zona alerta AMARELA: -195.5°C < T <= -193.5°C (LED1)
+        // Zona alerta VERMELHA: T > -193.5°C (LED2+Buzzer)
+        bool isInAlertZone = (currentTemp > TEMP_YELLOW_ALERT_THRESHOLD);
         
         if (isInAlertZone) {
             Serial.println("\n🚨 ════════════════════════════════════════════════════");
-            if (currentTemp <= TEMP_RED_ALERT_THRESHOLD) {
-                Serial.printf("🚨  TEMPERATURA VERMELHA EM ALERTA: %.1f°C (≤ %.1f°C)\n", 
+            if (currentTemp > TEMP_RED_ALERT_THRESHOLD) {
+                Serial.printf("🚨  TEMPERATURA VERMELHA EM ALERTA: %.1f°C (> %.1f°C)\n", 
                              currentTemp, TEMP_RED_ALERT_THRESHOLD);
             } else {
                 Serial.printf("⚠️  TEMPERATURA AMARELA EM ALERTA: %.1f°C (%.1f a %.1f°C)\n", 
-                             currentTemp, TEMP_RED_ALERT_THRESHOLD, TEMP_YELLOW_ALERT_THRESHOLD);
+                             currentTemp, TEMP_YELLOW_ALERT_THRESHOLD, TEMP_RED_ALERT_THRESHOLD);
             }
             Serial.println("🚨  ESP32 PERMANECERÁ ACORDADO até normalizar!");
             Serial.println("🚨  Operação contínua 24h ativada");
@@ -1236,6 +1261,9 @@ void setup()
             // Entrar em loop de monitoramento contínuo até temperatura normalizar
             monitorTemperatureUntilSafe(currentTemp);
         }
+
+        // Mantém LED azul piscando como indicação de operação contínua.
+        ledOperationMode();
         
         Serial.println("✅ Temperatura normal - operando continuamente 24h");
         Serial.println("🔌 Modo CA ativo: operação contínua 24h");
@@ -1757,7 +1785,7 @@ void loop()
             }
         }
         wifiWasEverConnected = true;
-        digitalWrite(LED_PIN, LOW); // LED apagado = OK
+        ledOperationMode();
     }
 
     // Verificar botão de configuração (pressionar por 5 segundos)
@@ -1803,6 +1831,18 @@ void loop()
                          (WiFi.status() == WL_CONNECTED ? "OK" : "ERRO"),
                          temp,
                          formatUptime(millis()).c_str());
+
+            if (temp > TEMP_YELLOW_ALERT_THRESHOLD) {
+                if (WiFi.status() != WL_CONNECTED) {
+                    Serial.println("ℹ️ Temperatura em alerta detectada durante reconexão WiFi - aguardando estabilização");
+                } else if (confirmTemperatureAboveThreshold(temp, TEMP_YELLOW_ALERT_THRESHOLD)) {
+                    Serial.println("⚠️ Temperatura em zona de alerta confirmada no monitoramento contínuo");
+                    Serial.println("📡 Entrando no modo de envio por faixa: amarelo=5min, vermelho=1min");
+                    monitorTemperatureUntilSafe(temp);
+                } else {
+                    Serial.println("ℹ️ Alerta de temperatura descartado (leitura transitória)");
+                }
+            }
         } else {
             Serial.printf("STATUS: WiFi=%s | Temp=ERRO | Uptime=%s\n",
                          (WiFi.status() == WL_CONNECTED ? "OK" : "ERRO"),
@@ -2463,9 +2503,13 @@ void readAndSendSensorData()
         return;
     }
 
-    if (temperature <= TEMP_YELLOW_ALERT_THRESHOLD) {
-        Serial.println("⚠️ Temperatura em zona de alerta detectada antes de conectar WiFi");
-        checkTemperatureAlerts(temperature);
+    if (temperature > TEMP_YELLOW_ALERT_THRESHOLD) {
+        if (confirmTemperatureAboveThreshold(temperature, TEMP_YELLOW_ALERT_THRESHOLD)) {
+            Serial.println("⚠️ Temperatura em zona de alerta confirmada antes de conectar WiFi");
+            checkTemperatureAlerts(temperature);
+        } else {
+            Serial.println("ℹ️ Alerta de temperatura descartado (transitório durante tentativa de conexão)");
+        }
     }
     
     // ===== ALERTAS DE TEMPERATURA =====
@@ -3899,16 +3943,21 @@ float performQuickReading()
         }
     }
 
-    if (temperature <= TEMP_YELLOW_ALERT_THRESHOLD) {
-        Serial.println("⚠️ Temperatura em zona de alerta detectada antes de conectar WiFi");
-        checkTemperatureAlerts(temperature);
+    if (temperature > TEMP_YELLOW_ALERT_THRESHOLD) {
+        if (confirmTemperatureAboveThreshold(temperature, TEMP_YELLOW_ALERT_THRESHOLD)) {
+            Serial.println("⚠️ Temperatura em zona de alerta confirmada antes de conectar WiFi");
+            checkTemperatureAlerts(temperature);
+        } else {
+            Serial.println("ℹ️ Alerta de temperatura descartado (transitório durante tentativa de conexão)");
+        }
     }
     
     // Em modo CA 24h, não há alertas de bateria nem hibernação por carga baixa.
     
     // ===== ALERTAS DE TEMPERATURA E LÓGICA DE ENVIO CONTÍNUO =====
-    // Se a temperatura estiver CRÍTICA (Zona 3: ≤ 193.5°C), entrar em modo de alerta contínuo
-    if (temperature <= TEMP_RED_ALERT_THRESHOLD) {
+    // Se a temperatura estiver CRÍTICA (Zona 3: > -193.5°C), entrar em modo de alerta contínuo
+    if (temperature > TEMP_RED_ALERT_THRESHOLD &&
+        confirmTemperatureAboveThreshold(temperature, TEMP_RED_ALERT_THRESHOLD)) {
         Serial.println("\n🚨 ALERTA DE TEMPERATURA CRÍTICA DETECTADO!");
         Serial.println("🚨 Iniciando ciclo de envio contínuo e alerta sonoro/visual...");
         
@@ -3936,7 +3985,7 @@ float performQuickReading()
         }
         
         // 3. Entrar em loop de monitoramento contínuo
-        // Fica aqui até a temperatura baixar para nível seguro (< -150°C)
+        // Fica aqui até a temperatura voltar para nível seguro (<= TEMP_YELLOW_ALERT_THRESHOLD)
         monitorTemperatureUntilSafe(temperature);
         
         // 4. Quando retornar de monitorTemperatureUntilSafe, significa que normalizou
@@ -4028,7 +4077,16 @@ float performQuickReading()
         Serial.printf("🔄 [%d/%d] Tentando conectar Supabase...\n", attempt, MAX_RETRY_ATTEMPTS);
         
         HTTPClient http;
-        http.begin(String(supabaseUrl) + "/auth/v1/health");
+        WiFiClientSecure client;
+        if (!beginSupabaseRequest(http, client, String(supabaseUrl) + "/auth/v1/health")) {
+            Serial.println("❌ Falha ao iniciar HTTPS para Supabase");
+            http.end();
+            if (attempt < MAX_RETRY_ATTEMPTS) {
+                Serial.printf("⏳ Aguardando %ds...\n", RETRY_INTERVAL_SECONDS);
+                delay(RETRY_INTERVAL_SECONDS * 1000);
+            }
+            continue;
+        }
         http.setTimeout(5000);
         int httpCode = http.GET();
         http.end();
@@ -4304,18 +4362,31 @@ float performQuickReading()
 
 void monitorTemperatureUntilSafe(float initialTemp) {
     Serial.println("🔄 ALERTA ATIVO: Monitoramento contínuo iniciado...");
-    Serial.printf("✅ Retornará ao modo normal quando T > %.1f°C\n", TEMP_YELLOW_ALERT_THRESHOLD);
+    Serial.printf("✅ Retornará ao modo normal quando T <= %.1f°C\n", TEMP_YELLOW_ALERT_THRESHOLD);
     
     // Configurações do ciclo de alerta
-    const unsigned long RECHECK_INTERVAL = 30000; // 30 segundos entre leituras do sensor
-    const unsigned long ALERT_SEND_INTERVAL = 30000; // 30 segundos entre envios enquanto estiver em alerta
-    unsigned long resendIntervalMs = ALERT_SEND_INTERVAL;
+    const unsigned long RECHECK_INTERVAL = 5000; // 5 segundos entre leituras do sensor (fixo)
+    const unsigned long YELLOW_SEND_INTERVAL = 300000; // 5 minutos em alerta amarelo
+    const unsigned long RED_SEND_INTERVAL = 60000; // 1 minuto em alerta vermelho
     
-    Serial.printf("⏱️ Intervalo de reenvio configurado para: %lu segundos\n", resendIntervalMs / 1000);
+    auto getAlertSendInterval = [](float temp) -> unsigned long {
+        if (temp > TEMP_RED_ALERT_THRESHOLD) {
+            return RED_SEND_INTERVAL;
+        }
+        if (temp > TEMP_YELLOW_ALERT_THRESHOLD) {
+            return YELLOW_SEND_INTERVAL;
+        }
+        return YELLOW_SEND_INTERVAL;
+    };
     
     unsigned long lastCheck = 0;
     unsigned long lastSend = millis(); // já enviou o inicial antes de entrar aqui
     float currentTemp = initialTemp;
+    unsigned long resendIntervalMs = getAlertSendInterval(currentTemp);
+
+    Serial.printf("⏱️ Reenvio em ALERTA AMARELO: %lu segundos\n", YELLOW_SEND_INTERVAL / 1000);
+    Serial.printf("⏱️ Reenvio em ALERTA VERMELHO: %lu segundos\n", RED_SEND_INTERVAL / 1000);
+    Serial.printf("⏱️ Intervalo inicial aplicado: %lu segundos\n", resendIntervalMs / 1000);
 
     while (true) {
         if (isfinite(currentTemp)) {
@@ -4336,6 +4407,11 @@ void monitorTemperatureUntilSafe(float initialTemp) {
                 Serial.println("❌ PT100 desconectado/erro - monitoramento pausado");
             } else {
                 Serial.printf("🌡️ Monitoramento: %.1f°C\n", currentTemp);
+                unsigned long newInterval = getAlertSendInterval(currentTemp);
+                if (newInterval != resendIntervalMs) {
+                    resendIntervalMs = newInterval;
+                    Serial.printf("🔄 Mudança de faixa: novo intervalo de reenvio = %lu segundos\n", resendIntervalMs / 1000);
+                }
             }
         }
 
@@ -4350,7 +4426,7 @@ void monitorTemperatureUntilSafe(float initialTemp) {
             }
         }
 
-        if (isfinite(currentTemp) && currentTemp > TEMP_YELLOW_ALERT_THRESHOLD) {
+        if (isfinite(currentTemp) && currentTemp <= TEMP_YELLOW_ALERT_THRESHOLD) {
             Serial.println("✅ TEMPERATURA NORMALIZADA! Encerrando alerta.");
             digitalWrite(TEMP_ALERT_LED1, LOW);
             digitalWrite(TEMP_ALERT_LED2, LOW);
